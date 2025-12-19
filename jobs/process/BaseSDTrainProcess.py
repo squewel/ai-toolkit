@@ -668,7 +668,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # save optimizer
         if self.optimizer is not None:
             try:
-                filename = f'{adapter_name}{step_num}optimizer.pt'
+                filename = f'{step_num}optimizer.pt'
                 file_path = os.path.join(self.save_root, filename)
                 try:
                     state_dict = unwrap_model(self.optimizer).state_dict()
