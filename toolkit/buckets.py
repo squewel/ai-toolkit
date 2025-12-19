@@ -89,6 +89,15 @@ def get_bucket_for_image_size(
         divisibility: int = 8
 ) -> BucketResolution:
 
+    # --- CUSTOM RESOLUTIONS ---
+    # Define your exact target resolutions here
+    bucket_size_list = [
+        {"width": 512, "height": 704},
+        {"width": 704, "height": 512},
+        {"width": 600, "height": 600}, 
+        # Add any other exact sizes you need
+    ]
+
     if bucket_size_list is None and resolution is None:
         # get resolution from width and height
         resolution = get_resolution(width, height)
