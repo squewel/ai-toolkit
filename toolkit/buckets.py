@@ -94,7 +94,7 @@ def get_bucket_for_image_size(
     bucket_size_list = [
         {"width": 512, "height": 704},
         {"width": 704, "height": 512},
-        {"width": 600, "height": 600}, 
+        {"width": 592, "height": 592}, 
         # Add any other exact sizes you need
     ]
 
