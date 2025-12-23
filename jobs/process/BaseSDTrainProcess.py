@@ -916,7 +916,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     paths = [p for p in paths if '_cn' not in p]
 
                 if len(paths) > 0:
-                    latest_path = max(paths, key=os.path.getctime)
+                    # --- NEW LOGIC: Prioritize "_original" ---
+                    # Create a subset of paths that contain "_original" in the filename
+                    original_paths = [p for p in paths if "_original" in os.path.basename(p)]
+                    
+                    if original_paths:
+                        # If original files exist, pick the latest one from THAT list
+                        latest_path = max(original_paths, key=os.path.getctime)
+                    else:
+                        # Otherwise, pick the latest from the full list
+                        latest_path = max(paths, key=os.path.getctime)
 
         return latest_path
 
