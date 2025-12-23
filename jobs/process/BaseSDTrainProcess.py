@@ -2089,6 +2089,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         self.lr_scheduler = lr_scheduler
 
+        # ==========================================
+        # FIX: Explicitly start EMA tracking
+        # ==========================================
+        self.setup_ema() 
+        # ==========================================
+
         ### HOOk ###
         self.before_dataset_load()
         # load datasets if passed in the root process
