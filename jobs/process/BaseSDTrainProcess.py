@@ -2126,14 +2126,55 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             self.progress_bar = None
 
+        # Ensure we have a fixed seed from config, or default to 42
+        base_seed = getattr(self.train_config, 'seed', 42) 
+        if base_seed is None: 
+            base_seed = 42
+
+        # ---------------------------------------------------------
+        # 1. INITIAL DATALOADER SETUP (Handles Start & Resume)
+        # ---------------------------------------------------------
+
+        grad_accum = getattr(self.train_config, 'gradient_accumulation', 1) 
+        if hasattr(self.train_config, 'gradient_accumulation_steps'):
+             grad_accum = self.train_config.gradient_accumulation_steps
+             
         if self.data_loader is not None:
+            # ### DETERMINISTIC UPDATE: SEEDING ###
+            # Seed Torch AND Python Random (for Bucket Managers)
+            current_seed = base_seed + self.epoch_num
+            torch.manual_seed(current_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(current_seed)
+            random.seed(current_seed)
+            np.random.seed(current_seed)
+            
             dataloader = self.data_loader
             dataloader_iterator = iter(dataloader)
+            
+            # ### DETERMINISTIC UPDATE: FAST FORWARD ###
+            if self.step_num > 0:
+                total_batches_processed = self.step_num * grad_accum
+                current_epoch_batch_index = total_batches_processed % len(dataloader)
+                
+                if current_epoch_batch_index > 0:
+                    print_acc(f"Resuming: Fast-forwarding {current_epoch_batch_index} batches...")
+                    for _ in tqdm(range(current_epoch_batch_index), desc="Restoring State", leave=False):
+                        try:
+                            next(dataloader_iterator)
+                        except StopIteration:
+                            break
         else:
             dataloader = None
             dataloader_iterator = None
 
+        # Do the same for reg dataloader if it exists
         if self.data_loader_reg is not None:
+            # Offset seed by 10000 so Reg images don't follow identical shuffle pattern to Training images
+            reg_seed = base_seed + self.epoch_num + 10000
+            torch.manual_seed(reg_seed)
+            random.seed(reg_seed)
+            
             dataloader_reg = self.data_loader_reg
             dataloader_iterator_reg = iter(dataloader_reg)
         else:
@@ -2202,9 +2243,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 batch = next(dataloader_iterator_reg)
                         except StopIteration:
                             with self.timer('reset_batch:reg'):
-                                # hit the end of an epoch, reset
                                 if self.progress_bar is not None:
                                     self.progress_bar.pause()
+                                
+                                # ### FIX: SEED REG DATALOADER ON RESTART ###
+                                # Note: We do NOT increment epoch_num here, as that is driven by the main loader
+                                reg_seed = base_seed + self.epoch_num + 10000
+                                torch.manual_seed(reg_seed)
+                                random.seed(reg_seed)
+                                
                                 dataloader_iterator_reg = iter(dataloader_reg)
                                 trigger_dataloader_setup_epoch(dataloader_reg)
 
@@ -2219,16 +2266,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 batch = next(dataloader_iterator)
                         except StopIteration:
                             with self.timer('reset_batch'):
-                                # hit the end of an epoch, reset
                                 if self.progress_bar is not None:
                                     self.progress_bar.pause()
+                                
+                                ### DETERMINISTIC UPDATE: NEW EPOCH SEEDING ###
+                                self.epoch_num += 1
+                                
+                                current_seed = base_seed + self.epoch_num
+                                torch.manual_seed(current_seed)
+                                if torch.cuda.is_available():
+                                    torch.cuda.manual_seed_all(current_seed)
+                                random.seed(current_seed)
+                                np.random.seed(current_seed)
+                                
                                 dataloader_iterator = iter(dataloader)
                                 trigger_dataloader_setup_epoch(dataloader)
-                                self.epoch_num += 1
+                                
                                 if self.train_config.gradient_accumulation_steps == -1:
-                                    # if we are accumulating for an entire epoch, trigger a step
                                     self.is_grad_accumulation_step = False
                                     self.grad_accumulation_step = 0
+                            
                             with self.timer('get_batch'):
                                 batch = next(dataloader_iterator)
                             if self.progress_bar is not None:
