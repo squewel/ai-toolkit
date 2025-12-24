@@ -838,26 +838,30 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.step_num > 0:
                 try:
                     # Get the file we just loaded (the Resume point)
-                    # Because of our new save() logic, get_latest_save_path() prioritizes the '_original' file
+                    # get_latest_save_path() prioritizes the '_original' file
                     latest_path = self.get_latest_save_path()
                     
-                    # We only attempt restore if we detected we loaded an "_original" file
-                    # If we loaded a standard file (no suffix), it implies we don't have separate weights,
-                    # so we just have to restart EMA from scratch (standard behavior).
+                    # We only attempt restore if we detected we loaded an "_original" file.
+                    # This implies separate weights exist.
                     if latest_path and "_original" in latest_path:
                         print_acc(f"Resuming EMA: Detected '_original' weights. Attempting to restore EMA state...")
                         
                         # The EMA weights should be in the file WITHOUT the _original suffix
                         ema_path = latest_path.replace("_original", "")
                         
+                        # Unwrap network to be safe against DDP wrappers (safe to do even if not wrapped)
+                        current_network = None
+                        if self.network is not None:
+                            current_network = unwrap_model(self.network)
+
                         if os.path.exists(ema_path):
                             print_acc(f"Loading EMA shadow weights from: {ema_path}")
                             
                             # --- A. BACKUP CURRENT (SHARP) WEIGHTS ---
                             # Move to CPU to avoid VRAM spikes during the swap
-                            if self.network is not None:
+                            if current_network is not None:
                                 # LoRA / Network training
-                                backup_state = {k: v.clone().cpu() for k, v in self.network.state_dict().items()}
+                                backup_state = {k: v.clone().cpu() for k, v in current_network.state_dict().items()}
                             else:
                                 # Full Fine-tuning
                                 backup_state = {k: v.clone().cpu() for k, v in self.sd.unet.state_dict().items()}
@@ -865,8 +869,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             # --- B. LOAD EMA WEIGHTS INTO LIVE MODEL ---
                             # We treat the model as a temporary container to load the EMA values
                             try:
-                                if self.network is not None:
-                                    self.network.load_weights(ema_path)
+                                if current_network is not None:
+                                    current_network.load_weights(ema_path)
                                 else:
                                     ema_state_dict = load_file(ema_path)
                                     self.sd.unet.load_state_dict(ema_state_dict, strict=False)
@@ -878,22 +882,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             # We temporarily set decay to 0.0. 
                             # Formula: New = (1-decay)*Current + decay*Shadow
                             # If decay=0: New = 1*Current + 0.
-                            # This forces the EMA shadow params to become exactly the Current params (which are the EMA weights we just loaded)
+                            # This forces the EMA shadow params to become exactly the Current params (loaded EMA weights)
                             
                             # Save original decay
                             original_decay = self.ema.decay
                             self.ema.decay = 0.0
                             
-                            # Force update
+                            # Force update (Shadow <- Live Model)
                             self.ema.update(params)
                             
                             # Restore original decay
                             self.ema.decay = original_decay
 
                             # --- D. RESTORE SHARP WEIGHTS ---
-                            if self.network is not None:
-                                self.network.load_state_dict(backup_state, strict=False)
-                                self.network.multiplier = 1.0 
+                            if current_network is not None:
+                                current_network.load_state_dict(backup_state, strict=False)
+                                current_network.multiplier = 1.0 
                             else:
                                 self.sd.unet.load_state_dict(backup_state, strict=False)
 
