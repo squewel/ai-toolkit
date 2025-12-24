@@ -832,6 +832,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 use_feedback=self.train_config.ema_config.use_feedback,
                 param_multiplier=self.train_config.ema_config.param_multiplier,
             )
+            print_acc(f"EMA successfuly set up")
 
             # 2. Advanced Resume Logic
             # Check if we are resuming (>0 steps)
