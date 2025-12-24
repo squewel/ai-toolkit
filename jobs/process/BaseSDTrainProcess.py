@@ -503,28 +503,35 @@ class BaseSDTrainProcess(BaseTrainProcess):
         step_num = ''
         if step is not None:
             self.last_save_step = step
+            # zeropad 9 digits
             step_num = f"_{str(step).zfill(9)}"
 
         self.update_training_metadata()
 
-        # Define which parameters the EMA is tracking
-        # We need this reference to swap weights in and out
-        ema_params = None
+        # ---------------------------------------------------------
+        # PREPARE EMA PARAMETERS
+        # We identify the exact parameters the save function will read
+        # to ensure the EMA swap happens on these specific tensors.
+        # ---------------------------------------------------------
+        ema_params = []
         if self.ema is not None:
             if self.network is not None:
-                # LoRA Training
-                ema_params = list(self.network.parameters())
+                # LoRA / Network training
+                # Unwrap to ensure we get the base model parameters
+                net_to_read = unwrap_model(self.network)
+                ema_params = list(net_to_read.parameters())
             elif self.is_fine_tuning:
-                # Full Fine-Tuning (adjust based on what you are actually training)
-                # This gathers UNet and Text Encoder params if they are trainable
-                ema_params = []
+                # Full Fine-Tuning
                 if self.train_config.train_unet:
-                    ema_params += list(self.sd.unet.parameters())
+                    ema_params += list(unwrap_model(self.sd.unet).parameters())
                 if self.train_config.train_text_encoder:
-                    # Note: Adjust for te1/te2 depending on your specific SD version logic
-                    ema_params += list(self.sd.text_encoder.parameters())
+                    # Adjust 'text_encoder' vs 'text_encoder_1' based on your SD version/codebase
+                    if hasattr(self.sd, 'text_encoder') and self.sd.text_encoder:
+                        ema_params += list(unwrap_model(self.sd.text_encoder).parameters())
 
         # 2. Determine Passes
+        # Pass 1: 'main' -> EMA weights (Inference ready)
+        # Pass 2: 'original' -> Original weights (Training ready)
         save_passes = ['main']
         if self.ema is not None:
             save_passes.append('original')
@@ -533,24 +540,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
             for pass_type in save_passes:
                 
                 # --- A. Handle Weights Swapping ---
-                # We use a flag to know if we need to restore later
-                swapped_to_ema = False 
-                
-                if self.ema is not None and ema_params is not None:
+                if self.ema is not None and len(ema_params) > 0:
                     if pass_type == 'main':
-                        # 1. Back up the current training weights
-                        self.ema.store(ema_params)
-                        # 2. Overwrite model with EMA weights
+                        # 1. Store original & set internal flag to eval
+                        self.ema.eval()
+                        # 2. FORCE copy to the explicit params we defined above.
+                        #    This fixes the "identical checkpoint" issue by ensuring 
+                        #    the visible model tensors get the EMA values.
                         self.ema.copy_to(ema_params)
-                        # 3. Mark that we are currently holding EMA weights
-                        swapped_to_ema = True
-                        
-                        # Optional: Set eval mode for consistency (though not strictly required for saving weights)
-                        self.ema.eval() 
                     else:
-                        # For 'original' pass, we ensure we are in training mode
-                        # (Weights are already original because we restore at the end of the loop)
+                        # 1. Restore original & set internal flag to train
                         self.ema.train()
+                        # 2. FORCE restore to the explicit params
+                        self.ema.restore(ema_params)
 
                 # --- B. Determine Filename ---
                 suffix = ""
@@ -562,6 +564,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 # --- C. Prepare Metadata ---
                 save_meta = copy.deepcopy(self.meta)
+                # get extra meta
                 if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
                     additional_save_meta = self.adapter.get_additional_save_metadata()
                     if additional_save_meta is not None:
@@ -571,73 +574,145 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 save_meta = get_meta_for_safetensors(save_meta, self.job.name)
 
                 # --- D. Save Weights ---
-                try:
-                    if not self.is_fine_tuning:
-                        # NETWORK / LORA SAVING
-                        if self.network is not None:
-                            lora_name = self.job.name
-                            if self.named_lora:
-                                lora_name += '_LoRA'
+                if not self.is_fine_tuning:
+                    # NETWORK / LORA SAVING
+                    if self.network is not None:
+                        lora_name = self.job.name
+                        if self.named_lora:
+                            lora_name += '_LoRA'
 
-                            filename = f'{lora_name}{step_num}{suffix}.safetensors'
-                            file_path = os.path.join(self.save_root, filename)
-                            prev_multiplier = self.network.multiplier
-                            self.network.multiplier = 1.0
-
-                            embedding_dict = self.embedding.state_dict() if self.embedding else None
-                            self.network.save_weights(
-                                file_path,
-                                dtype=get_torch_dtype(self.save_config.dtype),
-                                metadata=save_meta,
-                                extra_state_dict=embedding_dict
-                            )
-                            self.network.multiplier = prev_multiplier
-
-                        # EMBEDDINGS (Only save on main pass)
-                        if self.embedding is not None and pass_type == 'main':
-                            emb_filename = f'{self.embed_config.trigger}{step_num}.safetensors'
-                            emb_file_path = os.path.join(self.save_root, emb_filename)
-                            self.embedding.step = self.step_num
-                            if self.embed_config.save_format == "pt":
-                                emb_file_path = os.path.splitext(emb_file_path)[0] + ".pt"
-                            self.embedding.save(emb_file_path)
+                        filename = f'{lora_name}{step_num}{suffix}.safetensors'
+                        file_path = os.path.join(self.save_root, filename)
                         
-                        # ... (Rest of Decorator/Adapter saving logic stays here) ...
+                        # Save logic
+                        prev_multiplier = self.network.multiplier
+                        self.network.multiplier = 1.0
 
-                    else:
-                        # FULL FINE TUNING SAVING
-                        if self.save_config.save_format == "diffusers":
-                            file_path = file_path.replace('.safetensors', '')
-                            save_meta = parse_metadata_from_safetensors(save_meta)
+                        embedding_dict = self.embedding.state_dict() if self.embedding else None
+                        
+                        # We use self.network here, assuming it maps to the params we swapped above
+                        self.network.save_weights(
+                            file_path,
+                            dtype=get_torch_dtype(self.save_config.dtype),
+                            metadata=save_meta,
+                            extra_state_dict=embedding_dict
+                        )
+                        self.network.multiplier = prev_multiplier
 
-                        if self.sd.refiner_unet and self.train_config.train_refiner:
-                            refiner_name = self.job.name + '_refiner'
-                            filename = f'{refiner_name}{step_num}{suffix}.safetensors'
-                            file_path = os.path.join(self.save_root, filename)
-                            self.sd.save_refiner(
-                                file_path,
-                                save_meta,
-                                get_torch_dtype(self.save_config.dtype)
-                            )
-                        if self.train_config.train_unet or self.train_config.train_text_encoder:
-                            self.sd.save(
-                                file_path,
-                                save_meta,
-                                get_torch_dtype(self.save_config.dtype)
-                            )
+                    # EMBEDDINGS (Only save on main pass)
+                    if self.embedding is not None and pass_type == 'main':
+                        emb_filename = f'{self.embed_config.trigger}{step_num}.safetensors'
+                        emb_file_path = os.path.join(self.save_root, emb_filename)
+                        self.embedding.step = self.step_num
+                        if self.embed_config.save_format == "pt":
+                            emb_file_path = os.path.splitext(emb_file_path)[0] + ".pt"
+                        self.embedding.save(emb_file_path)
                     
-                    print_acc(f"Saved checkpoint to {file_path}")
+                    # DECORATOR
+                    if self.decorator is not None:
+                        dec_filename = f'{self.job.name}{step_num}{suffix}.safetensors'
+                        dec_file_path = os.path.join(self.save_root, dec_filename)
+                        decorator_state_dict = self.decorator.state_dict()
+                        for key, value in decorator_state_dict.items():
+                            if isinstance(value, torch.Tensor):
+                                decorator_state_dict[key] = value.clone().to('cpu', dtype=get_torch_dtype(self.save_config.dtype))
+                        save_file(
+                            decorator_state_dict,
+                            dec_file_path,
+                            metadata=save_meta,
+                        )
 
-                finally:
-                    # CRITICAL: If we swapped to EMA for this pass, we MUST restore original weights immediately
-                    # before the next loop iteration or before returning to training.
-                    if swapped_to_ema and ema_params is not None:
-                        self.ema.restore(ema_params)
+                    # ADAPTERS
+                    if self.adapter is not None and self.adapter_config.train:
+                        adapter_name = self.job.name
+                        if self.network_config is not None or self.embedding is not None:
+                            if self.adapter_config.type == 't2i':
+                                adapter_name += '_t2i'
+                            elif self.adapter_config.type == 'control_net':
+                                adapter_name += '_cn'
+                            elif self.adapter_config.type == 'clip':
+                                adapter_name += '_clip'
+                            elif self.adapter_config.type.startswith('ip'):
+                                adapter_name += '_ip'
+                            else:
+                                adapter_name += '_adapter'
+
+                        filename = f'{adapter_name}{step_num}{suffix}.safetensors'
+                        file_path = os.path.join(self.save_root, filename)
+                        
+                        state_dict = self.adapter.state_dict()
+                        if self.adapter_config.type == 't2i':
+                            save_t2i_from_diffusers(
+                                state_dict,
+                                output_file=file_path,
+                                meta=save_meta,
+                                dtype=get_torch_dtype(self.save_config.dtype)
+                            )
+                        elif self.adapter_config.type == 'control_net':
+                            name_or_path = file_path.replace('.safetensors', '')
+                            orig_device = self.adapter.device
+                            orig_dtype = self.adapter.dtype
+                            self.adapter = self.adapter.to(torch.device('cpu'), dtype=get_torch_dtype(self.save_config.dtype))
+                            self.adapter.save_pretrained(
+                                name_or_path,
+                                dtype=get_torch_dtype(self.save_config.dtype),
+                                safe_serialization=True
+                            )
+                            meta_path = os.path.join(name_or_path, 'aitk_meta.yaml')
+                            with open(meta_path, 'w') as f:
+                                yaml.dump(self.meta, f)
+                            self.adapter = self.adapter.to(orig_device, dtype=orig_dtype)
+                        else:
+                            direct_save = False
+                            if self.adapter_config.train_only_image_encoder:
+                                direct_save = True
+                            elif isinstance(self.adapter, CustomAdapter):
+                                direct_save = self.adapter.do_direct_save
+                            save_ip_adapter_from_diffusers(
+                                state_dict,
+                                output_file=file_path,
+                                meta=save_meta,
+                                dtype=get_torch_dtype(self.save_config.dtype),
+                                direct_save=direct_save
+                            )
+                else:
+                    # FULL FINE TUNING SAVING
+                    if self.save_config.save_format == "diffusers":
+                        file_path = file_path.replace('.safetensors', '')
+                        save_meta = parse_metadata_from_safetensors(save_meta)
+
+                    if self.sd.refiner_unet and self.train_config.train_refiner:
+                        refiner_name = self.job.name + '_refiner'
+                        filename = f'{refiner_name}{step_num}{suffix}.safetensors'
+                        file_path = os.path.join(self.save_root, filename)
+                        self.sd.save_refiner(
+                            file_path,
+                            save_meta,
+                            get_torch_dtype(self.save_config.dtype)
+                        )
+                    if self.train_config.train_unet or self.train_config.train_text_encoder:
+                        self.sd.save(
+                            file_path,
+                            save_meta,
+                            get_torch_dtype(self.save_config.dtype)
+                        )
+                
+                print_acc(f"Saved checkpoint to {file_path}")
 
         finally:
-            # Redundant safety: Ensure we are back in training mode
+            # SAFETY: Always ensure we return to training mode (Original weights)
+            # This is crucial for "resume" logic to work in subsequent steps
             if self.ema is not None:
+                # 1. Trigger class logic
                 self.ema.train()
+                # 2. Force restore on the specific params we tracked (just to be safe)
+                if len(ema_params) > 0:
+                    try:
+                        self.ema.restore(ema_params)
+                    except Exception:
+                        # If self.ema.train() already restored them via weakrefs, 
+                        # this might fail or be redundant, which is fine in a finally block.
+                        pass
 
         # 3. Save Aux (Optimizer / SNR) - Only done once per step
         if self.snr_gos:
@@ -653,7 +728,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         
         if self.optimizer is not None:
             try:
-                # Using {step_num} prefix to match original file's logic and allow history
+                # Using {step_num} prefix to match original file's logic
                 filename = f'{step_num}optimizer.pt'
                 file_path = os.path.join(self.save_root, filename)
                 try:
