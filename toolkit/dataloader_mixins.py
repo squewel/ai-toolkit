@@ -200,29 +200,68 @@ class BucketsMixin:
         if not hasattr(self, 'dataset_config'):
             raise Exception(f'dataset_config not found on class instance {self.__class__.__name__}')
 
+        # If POI is active, we generally don't use static buckets, 
+        # but if you have a specific workflow, you might need to adjust this check.
         if self.epoch_num > 0 and self.dataset_config.poi is None:
-            # no need to rebuild buckets for now
-            # todo handle random cropping for buckets
             return
-        self.buckets = {}  # clear it
 
+        self.buckets = {}  # Clear previous buckets
         config: 'DatasetConfig' = self.dataset_config
-        resolution = config.resolution
-        bucket_tolerance = config.bucket_tolerance
         file_list: List['FileItemDTO'] = self.file_list
+        
+        # --- STRICT MODE SETUP ---
+        allowed_sizes = None
+        if config.bucket_resolutions is not None:
+            # Convert list of lists [[512,512], [512,320]] to a set of tuples {(512,512), (512,320)}
+            # Sets are O(1) lookup, incredibly fast for millions of files.
+            allowed_sizes = set((res[0], res[1]) for res in config.bucket_resolutions)
+        
+        skipped_count = 0
+        # -------------------------
 
-        # for file_item in enumerate(file_list):
         for idx, file_item in enumerate(file_list):
             file_item: 'FileItemDTO' = file_item
-            width = int(file_item.width * file_item.dataset_config.scale)
-            height = int(file_item.height * file_item.dataset_config.scale)
+            
+            # Calculate target dimensions based on scale (usually 1.0 for pre-processed)
+            width = int(file_item.width * config.scale)
+            height = int(file_item.height * config.scale)
+
+            # --- STRICT MODE LOGIC ---
+            if allowed_sizes is not None:
+                # Check if exact match exists in our allowed set
+                if (width, height) not in allowed_sizes:
+                    skipped_count += 1
+                    continue # Skip this file completely
+
+                # Optimization: Direct assignment. No cropping math needed.
+                file_item.scale_to_width = width
+                file_item.scale_to_height = height
+                file_item.crop_width = width
+                file_item.crop_height = height
+                file_item.crop_x = 0
+                file_item.crop_y = 0
+
+                # Add to bucket
+                bucket_key = f'{width}x{height}'
+                if bucket_key not in self.buckets:
+                    self.buckets[bucket_key] = Bucket(width, height)
+                self.buckets[bucket_key].file_list_idx.append(idx)
+                
+                # We are done with this file, move to next
+                continue
+            # -------------------------
+
+            # === FALLBACK: STANDARD LOGIC (For datasets without bucket_resolutions) ===
+            # This logic only runs if 'bucket_resolutions' is NOT set in config
+            
+            resolution = config.resolution
+            bucket_tolerance = config.bucket_tolerance
 
             did_process_poi = False
             if file_item.has_point_of_interest:
-                # Attempt to process the poi if we can. It wont process if the image is smaller than the resolution
                 did_process_poi = file_item.setup_poi_bucket()
+            
             if self.dataset_config.square_crop:
-                # we scale first so smallest size matches resolution
                 scale_factor_x = resolution / width
                 scale_factor_y = resolution / height
                 scale_factor = max(scale_factor_x, scale_factor_y)
@@ -237,56 +276,57 @@ class BucketsMixin:
                     file_item.crop_x = 0
                     file_item.crop_y = int(file_item.scale_to_height / 2 - resolution / 2)
             elif not did_process_poi:
+                # Standard auto-bucketing logic
                 bucket_resolution = get_bucket_for_image_size(
                     width, height,
                     resolution=resolution,
                     divisibility=bucket_tolerance
                 )
 
-                # Calculate scale factors for width and height
                 width_scale_factor = bucket_resolution["width"] / width
                 height_scale_factor = bucket_resolution["height"] / height
-
-                # Use the maximum of the scale factors to ensure both dimensions are scaled above the bucket resolution
                 max_scale_factor = max(width_scale_factor, height_scale_factor)
 
-                # round up
                 file_item.scale_to_width = int(math.ceil(width * max_scale_factor))
                 file_item.scale_to_height = int(math.ceil(height * max_scale_factor))
-
                 file_item.crop_height = bucket_resolution["height"]
                 file_item.crop_width = bucket_resolution["width"]
-
                 new_width = bucket_resolution["width"]
                 new_height = bucket_resolution["height"]
 
                 if self.dataset_config.random_crop:
-                    # random crop
                     crop_x = random.randint(0, file_item.scale_to_width - new_width)
                     crop_y = random.randint(0, file_item.scale_to_height - new_height)
                     file_item.crop_x = crop_x
                     file_item.crop_y = crop_y
                 else:
-                    # do central crop
                     file_item.crop_x = int((file_item.scale_to_width - new_width) / 2)
                     file_item.crop_y = int((file_item.scale_to_height - new_height) / 2)
 
-                if file_item.crop_y < 0 or file_item.crop_x < 0:
-                    print_acc('debug')
-
-            # check if bucket exists, if not, create it
             bucket_key = f'{file_item.crop_width}x{file_item.crop_height}'
             if bucket_key not in self.buckets:
                 self.buckets[bucket_key] = Bucket(file_item.crop_width, file_item.crop_height)
             self.buckets[bucket_key].file_list_idx.append(idx)
 
-        # print the buckets
+        # --- REPORTING ---
         self.shuffle_buckets()
         self.build_batch_indices()
+        
         if not quiet:
             print_acc(f'Bucket sizes for {self.dataset_path}:')
+            
+            # Report counts for each bucket
+            total_included = 0
             for key, bucket in self.buckets.items():
-                print_acc(f'{key}: {len(bucket.file_list_idx)} files')
+                count = len(bucket.file_list_idx)
+                print_acc(f'  - {key}: {count} files')
+                total_included += count
+            
+            # Report skipped files
+            if allowed_sizes is not None:
+                print_acc(f'  - Skipped: {skipped_count} files (Did not match bucket_resolutions)')
+                print_acc(f'  - Total Active: {total_included} files')
+            
             print_acc(f'{len(self.buckets)} buckets made')
 
 
