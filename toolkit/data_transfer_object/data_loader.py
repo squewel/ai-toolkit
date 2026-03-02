@@ -69,7 +69,7 @@ class FileItemDTO(
             use_db_entry = True
         
         if use_db_entry:
-            w, h, _ = size_database[file_key]
+            w, h = size_database[file_key]
         elif self.is_video:
             # Open the video file
             video = cv2.VideoCapture(self.path)
