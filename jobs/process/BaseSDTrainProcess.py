@@ -976,6 +976,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def load_training_state_from_metadata(self, path):
         if not self.accelerator.is_main_process:
             return
+        if path is not None and self.network_config is not None and path == self.network_config.pretrained_lora_path:
+            # dont load metadata from pretrained lora
+            return
         meta = None
         # if path is folder, then it is diffusers
         if os.path.isdir(path):
@@ -1446,28 +1449,33 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # if we have a 5d tensor, then we need to do it on a per batch item, per channel basis, per frame
                     s = (noise.shape[0], noise.shape[1], noise.shape[2], 1, 1)
                 
-                if self.train_config.random_noise_multiplier > 0.0:
-                    
-                    # do it on a per batch item, per channel basis
-                    noise_multiplier = 1 + torch.randn(
-                        s,
-                        device=noise.device,
-                        dtype=noise.dtype
-                    ) * self.train_config.random_noise_multiplier
-                
-            with self.timer('make_noisy_latents'):
-
                 noise = noise * noise_multiplier
+                
+                if self.train_config.do_signal_correction_noise:
+                    batch_noise = latents.clone().to(noise.device, dtype=noise.dtype)
+                    scn_scale = torch.randn(
+                        batch_noise.shape[0], batch_noise.shape[1], 1, 1,
+                        device=batch_noise.device, 
+                        dtype=batch_noise.dtype
+                    ) * self.train_config.signal_correction_noise_scale
+                    batch_noise = batch_noise * scn_scale
+                    noise = noise + batch_noise 
                 
                 if self.train_config.random_noise_shift > 0.0:
                     # get random noise -1 to 1
                     noise_shift = torch.randn(
-                        s,  
+                        batch_size, latents.shape[1], 1, 1,
                         device=noise.device,
                         dtype=noise.dtype
                     ) * self.train_config.random_noise_shift
                     # add to noise
                     noise += noise_shift
+                
+                if self.train_config.random_noise_multiplier > 0.0:
+                    sigma = self.train_config.random_noise_multiplier
+                    noise_multiplier = torch.exp(torch.randn(s, device=noise.device, dtype=noise.dtype) * sigma)
+                
+            with self.timer('make_noisy_latents'):
 
                 latent_multiplier = self.train_config.latent_multiplier
 
@@ -1478,6 +1486,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     latent_multiplier = normalizer
 
                 latents = latents * latent_multiplier
+                
+                if self.train_config.do_blank_stabilization:
+                    # zero out latents with blank prompts
+                    blank_latent = torch.zeros_like(latents)
+                    for i, prompt in enumerate(conditioned_prompts):
+                        if prompt.strip() == '':
+                            latents[i] = blank_latent[i]
+                
                 batch.latents = latents
 
                 # normalize latents to a mean of 0 and an std of 1
@@ -1667,7 +1683,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.hook_before_model_load()
         model_config_to_load = copy.deepcopy(self.model_config)
 
-        if self.is_fine_tuning:
+        if self.is_fine_tuning or self.train_config.merge_network_on_save:
             # get the latest checkpoint
             # check to see if we have a latest save
             latest_save_path = self.get_latest_save_path()
@@ -1961,7 +1977,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 latest_save_path = self.get_latest_save_path(lora_name)
                 extra_weights = None
-                if latest_save_path is not None:
+                if latest_save_path is not None and not self.train_config.merge_network_on_save:
                     print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
                     print_acc(f"Loading from {latest_save_path}")
                     extra_weights = self.load_weights(latest_save_path)
@@ -2417,6 +2433,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             with torch.no_grad():
                 # torch.cuda.empty_cache()
                 # if optimizer has get_lrs method, then use it
+                learning_rate = 0.0
                 if not did_oom and loss_dict is not None:
                     if hasattr(optimizer, 'get_avg_learning_rate'):
                         learning_rate = optimizer.get_avg_learning_rate()
@@ -2487,9 +2504,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             # log to tensorboard
                             if self.accelerator.is_main_process:
                                 if self.writer is not None:
-                                    for key, value in loss_dict.items():
-                                        self.writer.add_scalar(f"{key}", value, self.step_num)
-                                    self.writer.add_scalar(f"lr", learning_rate, self.step_num)
+                                    if loss_dict is not None:
+                                        for key, value in loss_dict.items():
+                                            self.writer.add_scalar(f"{key}", value, self.step_num)
+                                        self.writer.add_scalar(f"lr", learning_rate, self.step_num)
                                 if self.progress_bar is not None:
                                     self.progress_bar.unpause()
                         
@@ -2498,10 +2516,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             self.logger.log({
                                 'learning_rate': learning_rate,
                             })
-                            for key, value in loss_dict.items():
-                                self.logger.log({
-                                    f'loss/{key}': value,
-                                })
+                            if loss_dict is not None:
+                                for key, value in loss_dict.items():
+                                    self.logger.log({
+                                        f'loss/{key}': value,
+                                    })
                     elif self.logging_config.log_every is None:
                         if self.accelerator.is_main_process:
                             # log every step
