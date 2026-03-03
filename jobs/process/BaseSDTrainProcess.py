@@ -729,7 +729,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.optimizer is not None:
             try:
                 # Using {step_num} prefix to match original file's logic
-                filename = f'{step_num}optimizer.pt'
+                filename = f'{self.job.name}{step_num}_optimizer.pt'
                 file_path = os.path.join(self.save_root, filename)
                 try:
                     state_dict = unwrap_model(self.optimizer).state_dict()
@@ -930,46 +930,34 @@ class BaseSDTrainProcess(BaseTrainProcess):
         pass
 
     def get_latest_save_path(self, name=None, post=''):
-        if name == None:
-            name = self.job.name
-        # get latest saved step
+        # name and post are kept in the signature for compatibility 
+        # but are ignored since we only want the absolute latest safetensors file
+        
         latest_path = None
         if os.path.exists(self.save_root):
-            # Define patterns for both files and directories
-            patterns = [
-                f"{name}*{post}.safetensors",
-                f"{name}*{post}.pt",
-                f"{name}*{post}"
-            ]
-            # Search for both files and directories
-            paths = []
-            for pattern in patterns:
-                paths.extend(glob.glob(os.path.join(self.save_root, pattern)))
+            # Just grab all safetensors files in the folder
+            search_pattern = os.path.join(self.save_root, '*.safetensors')
+            paths = glob.glob(search_pattern)
 
-            # Filter out non-existent paths and sort by creation time
             if paths:
-                paths = [p for p in paths if os.path.exists(p)]
-                # remove false positives
-                if '_LoRA' not in name:
-                    paths = [p for p in paths if '_LoRA' not in p]
-                if '_refiner' not in name:
-                    paths = [p for p in paths if '_refiner' not in p]
-                if '_t2i' not in name:
-                    paths = [p for p in paths if '_t2i' not in p]
-                if '_cn' not in name:
-                    paths = [p for p in paths if '_cn' not in p]
-
-                if len(paths) > 0:
-                    # --- NEW LOGIC: Prioritize "_original" ---
-                    # Create a subset of paths that contain "_original" in the filename
-                    original_paths = [p for p in paths if "_original" in os.path.basename(p)]
+                # --- Prioritize "_original" ---
+                original_paths =[p for p in paths if "_original" in os.path.basename(p)]
+                target_paths = original_paths if original_paths else paths
+                
+                # Helper function to extract step count dynamically
+                def extract_step(filepath):
+                    # Drops ".safetensors"
+                    base = os.path.splitext(os.path.basename(filepath))[0]
                     
-                    if original_paths:
-                        # If original files exist, pick the latest one from THAT list
-                        latest_path = max(original_paths, key=os.path.getctime)
-                    else:
-                        # Otherwise, pick the latest from the full list
-                        latest_path = max(paths, key=os.path.getctime)
+                    # Read chunks separated by "_" from right to left
+                    for part in reversed(base.split('_')):
+                        if part.isdigit():
+                            return int(part)
+                            
+                    return -1 # Fallback if no digits exist
+
+                # Pick the path with the highest step count
+                latest_path = max(target_paths, key=extract_step)
 
         return latest_path
 
@@ -2106,10 +2094,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # only works for adafactor, but it should have thrown an error prior to this otherwise
             self.optimizer.enable_paramiter_swapping(self.train_config.paramiter_swapping_factor)
 
-        # check if it exists
-        optimizer_state_filename = f'optimizer.pt'
-        optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
-        if os.path.exists(optimizer_state_file_path):
+        ############################## FIND EXISITNG OPTIMIZER CHECKPOINT ##############################
+
+        search_pattern = os.path.join(self.save_root, '*_optimizer.pt')
+        optimizer_files = glob.glob(search_pattern)
+
+        if optimizer_files:
+
+            optimizer_state_file_path = max(
+                optimizer_files, 
+                key=lambda f: int(os.path.basename(f).split('_')[-2])
+            )
+
             # try to load
             # previous param groups
             # previous_params = copy.deepcopy(optimizer.param_groups)
