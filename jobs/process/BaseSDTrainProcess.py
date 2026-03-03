@@ -495,10 +495,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if not self.accelerator.is_main_process:
             return
         flush()
-        if self.ema is not None:
-            # always save params as ema
-            self.ema.eval()
-
+        
+        # 1. Setup paths
         if not os.path.exists(self.save_root):
             os.makedirs(self.save_root, exist_ok=True)
 
@@ -509,163 +507,214 @@ class BaseSDTrainProcess(BaseTrainProcess):
             step_num = f"_{str(step).zfill(9)}"
 
         self.update_training_metadata()
-        filename = f'{self.job.name}{step_num}.safetensors'
-        file_path = os.path.join(self.save_root, filename)
 
-        save_meta = copy.deepcopy(self.meta)
-        # get extra meta
-        if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
-            additional_save_meta = self.adapter.get_additional_save_metadata()
-            if additional_save_meta is not None:
-                for key, value in additional_save_meta.items():
-                    save_meta[key] = value
-
-        # prepare meta
-        save_meta = get_meta_for_safetensors(save_meta, self.job.name)
-        if not self.is_fine_tuning and not self.train_config.merge_network_on_save:
+        # ---------------------------------------------------------
+        # PREPARE EMA PARAMETERS
+        # We identify the exact parameters the save function will read
+        # to ensure the EMA swap happens on these specific tensors.
+        # ---------------------------------------------------------
+        ema_params = []
+        if self.ema is not None:
             if self.network is not None:
-                lora_name = self.job.name
-                if self.named_lora:
-                    # add _lora to name
-                    lora_name += '_LoRA'
+                # LoRA / Network training
+                # Unwrap to ensure we get the base model parameters
+                net_to_read = unwrap_model(self.network)
+                ema_params = list(net_to_read.parameters())
+            elif self.is_fine_tuning:
+                # Full Fine-Tuning
+                if self.train_config.train_unet:
+                    ema_params += list(unwrap_model(self.sd.unet).parameters())
+                if self.train_config.train_text_encoder:
+                    # Adjust 'text_encoder' vs 'text_encoder_1' based on your SD version/codebase
+                    if hasattr(self.sd, 'text_encoder') and self.sd.text_encoder:
+                        ema_params += list(unwrap_model(self.sd.text_encoder).parameters())
 
-                filename = f'{lora_name}{step_num}.safetensors'
-                file_path = os.path.join(self.save_root, filename)
-                prev_multiplier = self.network.multiplier
-                self.network.multiplier = 1.0
+        # 2. Determine Passes
+        # Pass 1: 'main' -> EMA weights (Inference ready)
+        # Pass 2: 'original' -> Original weights (Training ready)
+        save_passes = ['main']
+        if self.ema is not None:
+            save_passes.append('original')
 
-                # if we are doing embedding training as well, add that
-                embedding_dict = self.embedding.state_dict() if self.embedding else None
-                self.network.save_weights(
-                    file_path,
-                    dtype=get_torch_dtype(self.save_config.dtype),
-                    metadata=save_meta,
-                    extra_state_dict=embedding_dict
-                )
-                self.network.multiplier = prev_multiplier
-                # if we have an embedding as well, pair it with the network
-
-            # even if added to lora, still save the trigger version
-            if self.embedding is not None:
-                emb_filename = f'{self.embed_config.trigger}{step_num}.safetensors'
-                emb_file_path = os.path.join(self.save_root, emb_filename)
-                # for combo, above will get it
-                # set current step
-                self.embedding.step = self.step_num
-                # change filename to pt if that is set
-                if self.embed_config.save_format == "pt":
-                    # replace extension
-                    emb_file_path = os.path.splitext(emb_file_path)[0] + ".pt"
-                self.embedding.save(emb_file_path)
-            
-            if self.decorator is not None:
-                dec_filename = f'{self.job.name}{step_num}.safetensors'
-                dec_file_path = os.path.join(self.save_root, dec_filename)
-                decorator_state_dict = self.decorator.state_dict()
-                for key, value in decorator_state_dict.items():
-                    if isinstance(value, torch.Tensor):
-                        decorator_state_dict[key] = value.clone().to('cpu', dtype=get_torch_dtype(self.save_config.dtype))
-                save_file(
-                    decorator_state_dict,
-                    dec_file_path,
-                    metadata=save_meta,
-                )
-
-            if self.adapter is not None and self.adapter_config.train:
-                adapter_name = self.job.name
-                if self.network_config is not None or self.embedding is not None:
-                    # add _lora to name
-                    if self.adapter_config.type == 't2i':
-                        adapter_name += '_t2i'
-                    elif self.adapter_config.type == 'control_net':
-                        adapter_name += '_cn'
-                    elif self.adapter_config.type == 'clip':
-                        adapter_name += '_clip'
-                    elif self.adapter_config.type.startswith('ip'):
-                        adapter_name += '_ip'
+        try:
+            for pass_type in save_passes:
+                
+                # --- A. Handle Weights Swapping ---
+                if self.ema is not None and len(ema_params) > 0:
+                    if pass_type == 'main':
+                        # 1. Store original & set internal flag to eval
+                        self.ema.eval()
+                        # 2. FORCE copy to the explicit params we defined above.
+                        #    This fixes the "identical checkpoint" issue by ensuring 
+                        #    the visible model tensors get the EMA values.
+                        self.ema.copy_to(ema_params)
                     else:
-                        adapter_name += '_adapter'
+                        # 1. Restore original & set internal flag to train
+                        self.ema.train()
+                        # 2. FORCE restore to the explicit params
+                        self.ema.restore(ema_params)
 
-                filename = f'{adapter_name}{step_num}.safetensors'
+                # --- B. Determine Filename ---
+                suffix = ""
+                if pass_type == 'original':
+                    suffix = "_original"
+                
+                filename = f'{self.job.name}{step_num}{suffix}.safetensors'
                 file_path = os.path.join(self.save_root, filename)
-                # save adapter
-                state_dict = self.adapter.state_dict()
-                if self.adapter_config.type == 't2i':
-                    save_t2i_from_diffusers(
-                        state_dict,
-                        output_file=file_path,
-                        meta=save_meta,
-                        dtype=get_torch_dtype(self.save_config.dtype)
-                    )
-                elif self.adapter_config.type == 'control_net':
-                    # save in diffusers format
-                    name_or_path = file_path.replace('.safetensors', '')
-                    # move it to the new dtype and cpu
-                    orig_device = self.adapter.device
-                    orig_dtype = self.adapter.dtype
-                    self.adapter = self.adapter.to(torch.device('cpu'), dtype=get_torch_dtype(self.save_config.dtype))
-                    self.adapter.save_pretrained(
-                        name_or_path,
-                        dtype=get_torch_dtype(self.save_config.dtype),
-                        safe_serialization=True
-                    )
-                    meta_path = os.path.join(name_or_path, 'aitk_meta.yaml')
-                    with open(meta_path, 'w') as f:
-                        yaml.dump(self.meta, f)
-                    # move it back
-                    self.adapter = self.adapter.to(orig_device, dtype=orig_dtype)
+
+                # --- C. Prepare Metadata ---
+                save_meta = copy.deepcopy(self.meta)
+                # get extra meta
+                if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
+                    additional_save_meta = self.adapter.get_additional_save_metadata()
+                    if additional_save_meta is not None:
+                        for key, value in additional_save_meta.items():
+                            save_meta[key] = value
+
+                save_meta = get_meta_for_safetensors(save_meta, self.job.name)
+
+                # --- D. Save Weights ---
+                if not self.is_fine_tuning:
+                    # NETWORK / LORA SAVING
+                    if self.network is not None:
+                        lora_name = self.job.name
+                        if self.named_lora:
+                            lora_name += '_LoRA'
+
+                        filename = f'{lora_name}{step_num}{suffix}.safetensors'
+                        file_path = os.path.join(self.save_root, filename)
+                        
+                        # Save logic
+                        prev_multiplier = self.network.multiplier
+                        self.network.multiplier = 1.0
+
+                        embedding_dict = self.embedding.state_dict() if self.embedding else None
+                        
+                        # We use self.network here, assuming it maps to the params we swapped above
+                        self.network.save_weights(
+                            file_path,
+                            dtype=get_torch_dtype(self.save_config.dtype),
+                            metadata=save_meta,
+                            extra_state_dict=embedding_dict
+                        )
+                        self.network.multiplier = prev_multiplier
+
+                    # EMBEDDINGS (Only save on main pass)
+                    if self.embedding is not None and pass_type == 'main':
+                        emb_filename = f'{self.embed_config.trigger}{step_num}.safetensors'
+                        emb_file_path = os.path.join(self.save_root, emb_filename)
+                        self.embedding.step = self.step_num
+                        if self.embed_config.save_format == "pt":
+                            emb_file_path = os.path.splitext(emb_file_path)[0] + ".pt"
+                        self.embedding.save(emb_file_path)
+                    
+                    # DECORATOR
+                    if self.decorator is not None:
+                        dec_filename = f'{self.job.name}{step_num}{suffix}.safetensors'
+                        dec_file_path = os.path.join(self.save_root, dec_filename)
+                        decorator_state_dict = self.decorator.state_dict()
+                        for key, value in decorator_state_dict.items():
+                            if isinstance(value, torch.Tensor):
+                                decorator_state_dict[key] = value.clone().to('cpu', dtype=get_torch_dtype(self.save_config.dtype))
+                        save_file(
+                            decorator_state_dict,
+                            dec_file_path,
+                            metadata=save_meta,
+                        )
+
+                    # ADAPTERS
+                    if self.adapter is not None and self.adapter_config.train:
+                        adapter_name = self.job.name
+                        if self.network_config is not None or self.embedding is not None:
+                            if self.adapter_config.type == 't2i':
+                                adapter_name += '_t2i'
+                            elif self.adapter_config.type == 'control_net':
+                                adapter_name += '_cn'
+                            elif self.adapter_config.type == 'clip':
+                                adapter_name += '_clip'
+                            elif self.adapter_config.type.startswith('ip'):
+                                adapter_name += '_ip'
+                            else:
+                                adapter_name += '_adapter'
+
+                        filename = f'{adapter_name}{step_num}{suffix}.safetensors'
+                        file_path = os.path.join(self.save_root, filename)
+                        
+                        state_dict = self.adapter.state_dict()
+                        if self.adapter_config.type == 't2i':
+                            save_t2i_from_diffusers(
+                                state_dict,
+                                output_file=file_path,
+                                meta=save_meta,
+                                dtype=get_torch_dtype(self.save_config.dtype)
+                            )
+                        elif self.adapter_config.type == 'control_net':
+                            name_or_path = file_path.replace('.safetensors', '')
+                            orig_device = self.adapter.device
+                            orig_dtype = self.adapter.dtype
+                            self.adapter = self.adapter.to(torch.device('cpu'), dtype=get_torch_dtype(self.save_config.dtype))
+                            self.adapter.save_pretrained(
+                                name_or_path,
+                                dtype=get_torch_dtype(self.save_config.dtype),
+                                safe_serialization=True
+                            )
+                            meta_path = os.path.join(name_or_path, 'aitk_meta.yaml')
+                            with open(meta_path, 'w') as f:
+                                yaml.dump(self.meta, f)
+                            self.adapter = self.adapter.to(orig_device, dtype=orig_dtype)
+                        else:
+                            direct_save = False
+                            if self.adapter_config.train_only_image_encoder:
+                                direct_save = True
+                            elif isinstance(self.adapter, CustomAdapter):
+                                direct_save = self.adapter.do_direct_save
+                            save_ip_adapter_from_diffusers(
+                                state_dict,
+                                output_file=file_path,
+                                meta=save_meta,
+                                dtype=get_torch_dtype(self.save_config.dtype),
+                                direct_save=direct_save
+                            )
                 else:
-                    direct_save = False
-                    if self.adapter_config.train_only_image_encoder:
-                        direct_save = True
-                    elif isinstance(self.adapter, CustomAdapter):
-                        direct_save = self.adapter.do_direct_save
-                    save_ip_adapter_from_diffusers(
-                        state_dict,
-                        output_file=file_path,
-                        meta=save_meta,
-                        dtype=get_torch_dtype(self.save_config.dtype),
-                        direct_save=direct_save
-                    )
-        else:
-            if self.network is not None and self.train_config.merge_network_on_save:
-                # merge the network weights into a full model and save that
-                if not self.network.can_merge_in:
-                    raise ValueError("Network cannot merge in weights. Cannot save full model.")
-                
-                print_acc("Merging network weights into full model for saving...")
-                
-                self.network.merge_in(merge_weight=1.0)
-                # reset weights to zero
-                self.network.reset_weights()
-                self.network.is_merged_in = False
-                
-                print_acc("Done merging network weights.")
-                
-            if self.save_config.save_format == "diffusers":
-                # saving as a folder path
-                file_path = file_path.replace('.safetensors', '')
-                # convert it back to normal object
-                save_meta = parse_metadata_from_safetensors(save_meta)
+                    # FULL FINE TUNING SAVING
+                    if self.save_config.save_format == "diffusers":
+                        file_path = file_path.replace('.safetensors', '')
+                        save_meta = parse_metadata_from_safetensors(save_meta)
 
-            if self.sd.refiner_unet and self.train_config.train_refiner:
-                # save refiner
-                refiner_name = self.job.name + '_refiner'
-                filename = f'{refiner_name}{step_num}.safetensors'
-                file_path = os.path.join(self.save_root, filename)
-                self.sd.save_refiner(
-                    file_path,
-                    save_meta,
-                    get_torch_dtype(self.save_config.dtype)
-                )
-            if self.train_config.train_unet or self.train_config.train_text_encoder:
-                self.sd.save(
-                    file_path,
-                    save_meta,
-                    get_torch_dtype(self.save_config.dtype)
-                )
+                    if self.sd.refiner_unet and self.train_config.train_refiner:
+                        refiner_name = self.job.name + '_refiner'
+                        filename = f'{refiner_name}{step_num}{suffix}.safetensors'
+                        file_path = os.path.join(self.save_root, filename)
+                        self.sd.save_refiner(
+                            file_path,
+                            save_meta,
+                            get_torch_dtype(self.save_config.dtype)
+                        )
+                    if self.train_config.train_unet or self.train_config.train_text_encoder:
+                        self.sd.save(
+                            file_path,
+                            save_meta,
+                            get_torch_dtype(self.save_config.dtype)
+                        )
+                
+                print_acc(f"Saved checkpoint to {file_path}")
 
-        # save learnable params as json if we have thim
+        finally:
+            # SAFETY: Always ensure we return to training mode (Original weights)
+            # This is crucial for "resume" logic to work in subsequent steps
+            if self.ema is not None:
+                # 1. Trigger class logic
+                self.ema.train()
+                # 2. Force restore on the specific params we tracked (just to be safe)
+                if len(ema_params) > 0:
+                    try:
+                        self.ema.restore(ema_params)
+                    except Exception:
+                        # If self.ema.train() already restored them via weakrefs, 
+                        # this might fail or be redundant, which is fine in a finally block.
+                        pass
+
+        # 3. Save Aux (Optimizer / SNR) - Only done once per step
         if self.snr_gos:
             json_data = {
                 'offset_1': self.snr_gos.offset_1.item(),
@@ -673,16 +722,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 'scale': self.snr_gos.scale.item(),
                 'gamma': self.snr_gos.gamma.item(),
             }
-            path_to_save = file_path = os.path.join(self.save_root, 'learnable_snr.json')
+            path_to_save = os.path.join(self.save_root, 'learnable_snr.json')
             with open(path_to_save, 'w') as f:
                 json.dump(json_data, f, indent=4)
         
-        print_acc(f"Saved checkpoint to {file_path}")
-
-        # save optimizer
         if self.optimizer is not None:
             try:
-                filename = f'optimizer.pt'
+                # Using {step_num} prefix to match original file's logic
+                filename = f'{step_num}optimizer.pt'
                 file_path = os.path.join(self.save_root, filename)
                 try:
                     state_dict = unwrap_model(self.optimizer).state_dict()
@@ -695,10 +742,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc("Could not save optimizer")
 
         self.clean_up_saves()
-        self.post_save_hook(file_path)
+        
+        # Call hook with the MAIN file path (so extensions know the EMA file is ready)
+        main_filename = f'{self.job.name}{step_num}.safetensors'
+        main_file_path = os.path.join(self.save_root, main_filename)
+        self.post_save_hook(main_file_path)
 
-        if self.ema is not None:
-            self.ema.train()
         flush()
 
     # Called before the model is loaded
@@ -771,17 +820,99 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
     def setup_ema(self):
         if self.train_config.ema_config.use_ema:
-            # our params are in groups. We need them as a single iterable
+            # 1. Standard Initialization
             params = []
             for group in self.optimizer.param_groups:
                 for param in group['params']:
                     params.append(param)
+            
             self.ema = ExponentialMovingAverage(
                 params,
                 decay=self.train_config.ema_config.ema_decay,
                 use_feedback=self.train_config.ema_config.use_feedback,
                 param_multiplier=self.train_config.ema_config.param_multiplier,
             )
+            print_acc(f"EMA successfuly set up")
+
+            # 2. Advanced Resume Logic
+            # Check if we are resuming (>0 steps)
+            if self.step_num > 0:
+                try:
+                    # Get the file we just loaded (the Resume point)
+                    # get_latest_save_path() prioritizes the '_original' file
+                    latest_path = self.get_latest_save_path()
+                    
+                    # We only attempt restore if we detected we loaded an "_original" file.
+                    # This implies separate weights exist.
+                    if latest_path and "_original" in latest_path:
+                        print_acc(f"Resuming EMA: Detected '_original' weights. Attempting to restore EMA state...")
+                        
+                        # The EMA weights should be in the file WITHOUT the _original suffix
+                        ema_path = latest_path.replace("_original", "")
+                        
+                        # Unwrap network to be safe against DDP wrappers (safe to do even if not wrapped)
+                        current_network = None
+                        if self.network is not None:
+                            current_network = unwrap_model(self.network)
+
+                        if os.path.exists(ema_path):
+                            print_acc(f"Loading EMA shadow weights from: {ema_path}")
+                            
+                            # --- A. BACKUP CURRENT (SHARP) WEIGHTS ---
+                            # Move to CPU to avoid VRAM spikes during the swap
+                            if current_network is not None:
+                                # LoRA / Network training
+                                backup_state = {k: v.clone().cpu() for k, v in current_network.state_dict().items()}
+                            else:
+                                # Full Fine-tuning
+                                backup_state = {k: v.clone().cpu() for k, v in self.sd.unet.state_dict().items()}
+
+                            # --- B. LOAD EMA WEIGHTS INTO LIVE MODEL ---
+                            # We treat the model as a temporary container to load the EMA values
+                            try:
+                                if current_network is not None:
+                                    current_network.load_weights(ema_path)
+                                else:
+                                    ema_state_dict = load_file(ema_path)
+                                    self.sd.unet.load_state_dict(ema_state_dict, strict=False)
+                            except Exception as e:
+                                print_acc(f"Error loading EMA weights into model: {e}")
+                                raise e
+
+                            # --- C. CAPTURE STATE INTO EMA OBJECT ---
+                            # We temporarily set decay to 0.0. 
+                            # Formula: New = (1-decay)*Current + decay*Shadow
+                            # If decay=0: New = 1*Current + 0.
+                            # This forces the EMA shadow params to become exactly the Current params (loaded EMA weights)
+                            
+                            # Save original decay
+                            original_decay = self.ema.decay
+                            self.ema.decay = 0.0
+                            
+                            # Force update (Shadow <- Live Model)
+                            self.ema.update(params)
+                            
+                            # Restore original decay
+                            self.ema.decay = original_decay
+
+                            # --- D. RESTORE SHARP WEIGHTS ---
+                            if current_network is not None:
+                                current_network.load_state_dict(backup_state, strict=False)
+                                current_network.multiplier = 1.0 
+                            else:
+                                self.sd.unet.load_state_dict(backup_state, strict=False)
+
+                            print_acc("EMA state successfully restored from main checkpoint.")
+                            
+                            # Clear memory
+                            del backup_state
+                            flush()
+                        else:
+                            print_acc(f"Warning: Could not find sibling EMA file at {ema_path}. EMA will restart from current weights.")
+                except Exception as e:
+                    print_acc(f"Warning: Failed to restore EMA state: {e}")
+                    print_acc("EMA will restart from current weights (Momentum preserved, but smoothing reset).")
+                    # traceback.print_exc()
 
     def before_dataset_load(self):
         pass
@@ -829,16 +960,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     paths = [p for p in paths if '_cn' not in p]
 
                 if len(paths) > 0:
-                    latest_path = max(paths, key=os.path.getctime)
-        
-        if latest_path is None and self.network_config is not None and self.network_config.pretrained_lora_path is not None:
-            # set pretrained lora path as load path if we do not have a checkpoint to resume from
-            if os.path.exists(self.network_config.pretrained_lora_path):
-                latest_path = self.network_config.pretrained_lora_path
-                print_acc(f"Using pretrained lora path from config: {latest_path}")
-            else:
-                # no pretrained lora found
-                print_acc(f"Pretrained lora path from config does not exist: {self.network_config.pretrained_lora_path}")
+                    # --- NEW LOGIC: Prioritize "_original" ---
+                    # Create a subset of paths that contain "_original" in the filename
+                    original_paths = [p for p in paths if "_original" in os.path.basename(p)]
+                    
+                    if original_paths:
+                        # If original files exist, pick the latest one from THAT list
+                        latest_path = max(original_paths, key=os.path.getctime)
+                    else:
+                        # Otherwise, pick the latest from the full list
+                        latest_path = max(paths, key=os.path.getctime)
 
         return latest_path
 
@@ -2027,6 +2158,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         self.lr_scheduler = lr_scheduler
 
+        # ==========================================
+        # FIX: Explicitly start EMA tracking
+        # ==========================================
+        self.setup_ema() 
+        # ==========================================
+
         ### HOOk ###
         self.before_dataset_load()
         # load datasets if passed in the root process
@@ -2064,14 +2201,55 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             self.progress_bar = None
 
+        # Ensure we have a fixed seed from config, or default to 42
+        base_seed = getattr(self.train_config, 'seed', 42) 
+        if base_seed is None: 
+            base_seed = 42
+
+        # ---------------------------------------------------------
+        # 1. INITIAL DATALOADER SETUP (Handles Start & Resume)
+        # ---------------------------------------------------------
+
+        grad_accum = getattr(self.train_config, 'gradient_accumulation', 1) 
+        if hasattr(self.train_config, 'gradient_accumulation_steps'):
+             grad_accum = self.train_config.gradient_accumulation_steps
+             
         if self.data_loader is not None:
+            # ### DETERMINISTIC UPDATE: SEEDING ###
+            # Seed Torch AND Python Random (for Bucket Managers)
+            current_seed = base_seed + self.epoch_num
+            torch.manual_seed(current_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(current_seed)
+            random.seed(current_seed)
+            np.random.seed(current_seed)
+            
             dataloader = self.data_loader
             dataloader_iterator = iter(dataloader)
+            
+            # ### DETERMINISTIC UPDATE: FAST FORWARD ###
+            if self.step_num > 0:
+                total_batches_processed = self.step_num * grad_accum
+                current_epoch_batch_index = total_batches_processed % len(dataloader)
+                
+                if current_epoch_batch_index > 0:
+                    print_acc(f"Resuming: Fast-forwarding {current_epoch_batch_index} batches...")
+                    for _ in tqdm(range(current_epoch_batch_index), desc="Restoring State", leave=False):
+                        try:
+                            next(dataloader_iterator)
+                        except StopIteration:
+                            break
         else:
             dataloader = None
             dataloader_iterator = None
 
+        # Do the same for reg dataloader if it exists
         if self.data_loader_reg is not None:
+            # Offset seed by 10000 so Reg images don't follow identical shuffle pattern to Training images
+            reg_seed = base_seed + self.epoch_num + 10000
+            torch.manual_seed(reg_seed)
+            random.seed(reg_seed)
+            
             dataloader_reg = self.data_loader_reg
             dataloader_iterator_reg = iter(dataloader_reg)
         else:
@@ -2140,9 +2318,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 batch = next(dataloader_iterator_reg)
                         except StopIteration:
                             with self.timer('reset_batch:reg'):
-                                # hit the end of an epoch, reset
                                 if self.progress_bar is not None:
                                     self.progress_bar.pause()
+                                
+                                # ### FIX: SEED REG DATALOADER ON RESTART ###
+                                # Note: We do NOT increment epoch_num here, as that is driven by the main loader
+                                reg_seed = base_seed + self.epoch_num + 10000
+                                torch.manual_seed(reg_seed)
+                                random.seed(reg_seed)
+                                
                                 dataloader_iterator_reg = iter(dataloader_reg)
                                 trigger_dataloader_setup_epoch(dataloader_reg)
 
@@ -2157,16 +2341,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 batch = next(dataloader_iterator)
                         except StopIteration:
                             with self.timer('reset_batch'):
-                                # hit the end of an epoch, reset
                                 if self.progress_bar is not None:
                                     self.progress_bar.pause()
+                                
+                                ### DETERMINISTIC UPDATE: NEW EPOCH SEEDING ###
+                                self.epoch_num += 1
+                                
+                                current_seed = base_seed + self.epoch_num
+                                torch.manual_seed(current_seed)
+                                if torch.cuda.is_available():
+                                    torch.cuda.manual_seed_all(current_seed)
+                                random.seed(current_seed)
+                                np.random.seed(current_seed)
+                                
                                 dataloader_iterator = iter(dataloader)
                                 trigger_dataloader_setup_epoch(dataloader)
-                                self.epoch_num += 1
+                                
                                 if self.train_config.gradient_accumulation_steps == -1:
-                                    # if we are accumulating for an entire epoch, trigger a step
                                     self.is_grad_accumulation_step = False
                                     self.grad_accumulation_step = 0
+                            
                             with self.timer('get_batch'):
                                 batch = next(dataloader_iterator)
                             if self.progress_bar is not None:

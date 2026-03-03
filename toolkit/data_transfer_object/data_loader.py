@@ -75,16 +75,13 @@ class FileItemDTO(
 
         use_db_entry = False
         if file_key in size_database:
-            db_entry = size_database[file_key]
-            if (
-                db_entry is not None
-                and len(db_entry) >= 3
-                and db_entry[2] == file_signature
-            ):
-                use_db_entry = True
-
+            # BLIND TRUST MODIFICATION
+            # If the file exists in the JSON, trust the dimensions blindly.
+            # We ignore the hash check (db_entry[2]) completely.
+            use_db_entry = True
+        
         if use_db_entry:
-            w, h, _ = size_database[file_key]
+            w, h = size_database[file_key]
         elif self.is_video:
             # Open the video file
             video = cv2.VideoCapture(self.path)
