@@ -864,6 +864,19 @@ class DatasetConfig:
         self.random_scale: bool = kwargs.get('random_scale', False)
         self.random_crop: bool = kwargs.get('random_crop', False)
         self.resolution: int = kwargs.get('resolution', 512)
+        self.bucket_resolutions = kwargs.get('bucket_resolutions', None)
+        # custom bucket resolutions. Strict mode expects exact sizes of images (requires pre resizing of files)
+
+        # datasets:
+        #     - folder_path: "/path/to/dataset"
+        #         # STRICTLY REQUIRED FOR MAX SPEED:
+        #         scale: 1
+        #         resolution: 512 # This is ignored by the code above, but needed to pass init checks
+        #         bucket_resolutions: 
+        #         - [512, 512]
+        #         - [512, 320]
+        #         - [320, 512]
+
         self.scale: float = kwargs.get('scale', 1.0)
         self.buckets: bool = kwargs.get('buckets', True)
         self.bucket_tolerance: int = kwargs.get('bucket_tolerance', 64)
