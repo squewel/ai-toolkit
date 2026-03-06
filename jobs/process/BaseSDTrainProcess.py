@@ -77,6 +77,24 @@ def flush():
     torch.cuda.empty_cache()
     gc.collect()
 
+from torch.utils.data import Sampler, DataLoader
+
+class ResumeSampler(Sampler):
+    """
+    Yields a specific list of indices to resume training without reloading data.
+    MUST be defined at the global scope for pickling (num_workers > 0) to work.
+    """
+    def __init__(self, data_source, indices):
+        # We accept data_source to satisfy Sampler signature, but we don't strictly need it
+        super().__init__(data_source)
+        self.indices = indices
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self):
+        return len(self.indices)
+
 
 class BaseSDTrainProcess(BaseTrainProcess):
 
@@ -2209,10 +2227,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         grad_accum = getattr(self.train_config, 'gradient_accumulation', 1) 
         if hasattr(self.train_config, 'gradient_accumulation_steps'):
              grad_accum = self.train_config.gradient_accumulation_steps
+
+
+        # CUSTOM RESUME DS STATE 
              
         if self.data_loader is not None:
             # ### DETERMINISTIC UPDATE: SEEDING ###
-            # Seed Torch AND Python Random (for Bucket Managers)
             current_seed = base_seed + self.epoch_num
             torch.manual_seed(current_seed)
             if torch.cuda.is_available():
@@ -2220,21 +2240,59 @@ class BaseSDTrainProcess(BaseTrainProcess):
             random.seed(current_seed)
             np.random.seed(current_seed)
             
+            # 1. Grab the original dataloader
             dataloader = self.data_loader
-            dataloader_iterator = iter(dataloader)
-            
+
             # ### DETERMINISTIC UPDATE: FAST FORWARD ###
             if self.step_num > 0:
                 total_batches_processed = self.step_num * grad_accum
                 current_epoch_batch_index = total_batches_processed % len(dataloader)
                 
                 if current_epoch_batch_index > 0:
-                    print_acc(f"Resuming: Fast-forwarding {current_epoch_batch_index} batches...")
-                    for _ in tqdm(range(current_epoch_batch_index), desc="Restoring State", leave=False):
-                        try:
-                            next(dataloader_iterator)
-                        except StopIteration:
-                            break
+                    print_acc(f"Resuming: Instant fast-forward to batch {current_epoch_batch_index}...")
+                    
+                    # 2. Generate the exact list of indices this epoch would have used
+                    #    (Since we set the seed above, this list is deterministic and matches the original)
+                    full_epoch_indices = list(dataloader.sampler)
+                    
+                    # 3. Determine how many INDICES to skip in the sampler
+                    #    If batch_size is None (Buckets), the dataset returns a whole batch per index.
+                    #    If batch_size is Set (Normal), the dataset returns 1 image per index.
+                    if dataloader.batch_size is None:
+                        sampler_skip_count = current_epoch_batch_index
+                    else:
+                        sampler_skip_count = current_epoch_batch_index * dataloader.batch_size
+
+                    # 4. Slice the list to keep only the remaining items
+                    remaining_indices = full_epoch_indices[sampler_skip_count:]
+                    
+                    if len(remaining_indices) > 0:
+                        # 5. Create a specialized sampler with the remaining indices
+                        #    Note: We pass dataloader.dataset to satisfy standard Sampler args
+                        resume_sampler = ResumeSampler(dataloader.dataset, remaining_indices)
+
+                        # 6. Create a NEW DataLoader using the sliced sampler
+                        #    We copy properties to ensure training behaves exactly the same
+                        dataloader = DataLoader(
+                            dataloader.dataset,
+                            sampler=resume_sampler,           # <--- The magic happens here
+                            batch_size=dataloader.batch_size, # Keep original setting (None or Int)
+                            shuffle=False,                    # Order is explicitly strictly defined by our list
+                            
+                            # Copy existing loader settings
+                            num_workers=dataloader.num_workers,
+                            collate_fn=dataloader.collate_fn,
+                            pin_memory=dataloader.pin_memory,
+                            drop_last=dataloader.drop_last,
+                            prefetch_factor=dataloader.prefetch_factor,
+                            persistent_workers=dataloader.persistent_workers,
+                            worker_init_fn=dataloader.worker_init_fn
+                        )
+                    else:
+                        print_acc("  -  Epoch already finished, moving to next logic.")
+
+            # Create the iterator from the (possibly new) dataloader
+            dataloader_iterator = iter(dataloader)
         else:
             dataloader = None
             dataloader_iterator = None
