@@ -474,10 +474,10 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 with open(dataset_size_file, 'r') as f:
                     self.size_database = json.load(f)
                 
-                if "__version__" not in self.size_database or self.size_database["__version__"] != dataloader_version:
-                    print_acc("Upgrading size database to new version")
-                    # old version, delete and recreate
-                    self.size_database = {}
+                # if "__version__" not in self.size_database or self.size_database["__version__"] != dataloader_version:
+                #     print_acc("Upgrading size database to new version")
+                #     # old version, delete and recreate
+                #     self.size_database = {}
             except Exception as e:
                 print_acc(f"Error loading size database: {dataset_size_file}")
                 print_acc(e)
