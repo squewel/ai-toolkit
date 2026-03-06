@@ -82,11 +82,10 @@ from torch.utils.data import Sampler, DataLoader
 class ResumeSampler(Sampler):
     """
     Yields a specific list of indices to resume training without reloading data.
-    MUST be defined at the global scope for pickling (num_workers > 0) to work.
     """
     def __init__(self, data_source, indices):
-        # We accept data_source to satisfy Sampler signature, but we don't strictly need it
-        super().__init__(data_source)
+        # Do not call super().__init__(data_source) as Sampler may not accept args
+        self.data_source = data_source
         self.indices = indices
 
     def __iter__(self):
