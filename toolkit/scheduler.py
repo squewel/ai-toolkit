@@ -30,7 +30,7 @@ def get_lr_scheduler(
         # So: factor = desired_lr / initial_lr.
         
         # Attempt to get initial_lr, defaulting to current lr if not yet set
-        base_lr = optimizer.param_groups[0].get("initial_lr", optimizer.param_groups[0]["lr"])
+        base_lr = max(group.get("initial_lr", group["lr"]) for group in optimizer.param_groups)
         
         def lr_lambda(current_step):
             # 1. Before the first defined step, use the first target's LR
