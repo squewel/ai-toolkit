@@ -2516,11 +2516,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     else:
                         learning_rate = optimizer.param_groups[0]['lr']
 
-                    # Check if we have multiple parameter groups (e.g., DiT and TE)
                     if len(optimizer.param_groups) > 1:
-                        te_lr = optimizer.param_groups[1]['lr']
-                        prog_bar_string = f"lr: {learning_rate:.1e} te_lr: {te_lr:.1e}"
+                        # Kohya structurally ALWAYS adds Text Encoder params first, then UNet/DiT params
+                        te_lr = optimizer.param_groups[0]['lr']
+                        dit_lr = optimizer.param_groups[1]['lr']
+                            
+                        prog_bar_string = f"lr: {dit_lr:.1e} te_lr: {te_lr:.1e}"
+                        # Ensure TensorBoard logs the primary DiT LR
+                        learning_rate = dit_lr
                     else:
+                        # Only DiT is being trained (Group 0)
                         prog_bar_string = f"lr: {learning_rate:.1e}"
 
                     for key, value in loss_dict.items():
