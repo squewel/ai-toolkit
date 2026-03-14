@@ -10,52 +10,72 @@ def get_lr_scheduler(
 ):
 
     # --- Custom Piecewise Linear Scheduler ---
-        # scheduler config
-        # self.train_config.lr_scheduler = "step_targets"
-        # # "targets" is the key we will look for in the kwargs
-        # self.train_config.lr_scheduler_params = {
-        #     "targets": [[0, 1e-10], [1000, 1e-4], [2000, 1e-5]]
-        # }
+        # lr_scheduler: "step_targets"
+        # lr_scheduler_params:
+        #   targets: [[0, 1e-10], [1000, 1e-3], [30000, 1e-3], [40000, 1e-5]]
+        #   te_targets: [[0, 1e-11], [500, 1e-4],[15000, 1e-4], [25000, 1e-5], [40000, 1e-6]] # optional, if off and TE training on = sale by text_encoder_lr/lr. text_encoder_lr needs to be < lr 
     if name == "step_targets":
         targets = kwargs.get('targets', None)
+        te_targets = kwargs.get('te_targets', None) # Optional separate TE targets
+        
         if targets is None:
             raise ValueError("lr_scheduler_params must contain a 'targets' key for step_targets scheduler.")
         
         # Sort targets by step to ensure correct interpolation order
-        # targets structure: [[step, lr], [step, lr], ...]
         targets = sorted(targets, key=lambda x: x[0])
-        
-        # We need the optimizer's initial LR to calculate the Lambda factor.
-        # LambdaLR does: lr = initial_lr * factor. 
-        # So: factor = desired_lr / initial_lr.
-        
-        # Attempt to get initial_lr, defaulting to current lr if not yet set
-        base_lr = max(group.get("initial_lr", group["lr"]) for group in optimizer.param_groups)
-        
-        def lr_lambda(current_step):
-            # 1. Before the first defined step, use the first target's LR
-            if current_step < targets[0][0]:
-                return targets[0][1] / base_lr
+        if te_targets is not None:
+            te_targets = sorted(te_targets, key=lambda x: x[0])
             
-            # 2. After the last defined step, use the last target's LR
-            if current_step >= targets[-1][0]:
-                return targets[-1][1] / base_lr
-            
-            # 3. Find the interval [t_start, t_end] where current_step lies
-            for i in range(len(targets) - 1):
-                start_step, start_lr = targets[i]
-                end_step, end_lr = targets[i+1]
+        # Identify the main base LR (this will safely find the 1e-3 from your DiT)
+        main_base_lr = max(group.get("initial_lr", group["lr"]) for group in optimizer.param_groups)
+        
+        # Factory function to create an isolated lambda for a specific target curve
+        def create_lambda(target_list, base_lr_for_calc):
+            def lr_lambda(current_step):
+                # 1. Before the first defined step
+                if current_step < target_list[0][0]:
+                    return target_list[0][1] / base_lr_for_calc
                 
-                if start_step <= current_step < end_step:
-                    # Calculate progress (0.0 to 1.0) within this interval
-                    progress = (current_step - start_step) / (end_step - start_step)
-                    # Linear interpolation
-                    target_lr = start_lr + progress * (end_lr - start_lr)
-                    return target_lr / base_lr
-            
-            return targets[-1][1] / base_lr
+                # 2. After the last defined step
+                if current_step >= target_list[-1][0]:
+                    return target_list[-1][1] / base_lr_for_calc
+                
+                # 3. Find the interval and interpolate
+                for i in range(len(target_list) - 1):
+                    start_step, start_lr = target_list[i]
+                    end_step, end_lr = target_list[i+1]
+                    
+                    if start_step <= current_step < end_step:
+                        progress = (current_step - start_step) / (end_step - start_step)
+                        target_lr = start_lr + progress * (end_lr - start_lr)
+                        return target_lr / base_lr_for_calc
+                
+                return target_list[-1][1] / base_lr_for_calc
+            return lr_lambda
 
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        # If te_targets is provided, we assign separate curves
+        if te_targets is not None:
+            lambdas =[]
+            for group in optimizer.param_groups:
+                group_base_lr = group.get("initial_lr", group["lr"])
+                
+                # Safest heuristic: If this group's initial LR is smaller than the DiT's (e.g., 1e-4 < 1e-3),
+                # it is the Text Encoder. Assign it the te_targets.
+                if group_base_lr < main_base_lr:
+                    lambdas.append(create_lambda(te_targets, group_base_lr))
+                else:
+                    # Otherwise, it's the DiT (or another main component), give it the standard targets.
+                    lambdas.append(create_lambda(targets, group_base_lr))
+                    
+            # PyTorch accepts a list of lambdas, mapping them 1:1 to the parameter groups
+            return torch.optim.lr_scheduler.LambdaLR(optimizer, lambdas)
+        
+        else:
+            # Fallback (Original working behavior)
+            # We use the DiT's base LR to calculate the factor.
+            # PyTorch applies this single factor to all groups, perfectly preserving your ratio.
+            single_lambda = create_lambda(targets, main_base_lr)
+            return torch.optim.lr_scheduler.LambdaLR(optimizer, single_lambda)
 
     # --- Existing Schedulers ---
     if name == "cosine":
