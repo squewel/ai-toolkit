@@ -143,7 +143,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
     UNET_TARGET_REPLACE_MODULE = ["UNet2DConditionModel"]
     # UNET_TARGET_REPLACE_MODULE_CONV2D_3X3 = ["ResnetBlock2D", "Downsample2D", "Upsample2D"]
     UNET_TARGET_REPLACE_MODULE_CONV2D_3X3 = ["UNet2DConditionModel"]
-    TEXT_ENCODER_TARGET_REPLACE_MODULE = ["CLIPAttention", "CLIPMLP"]
+    TEXT_ENCODER_TARGET_REPLACE_MODULE = ["CLIPAttention", "CLIPMLP", "Qwen3Attention", "Qwen3MLP"]
     LORA_PREFIX_UNET = "lora_unet"
     PEFT_PREFIX_UNET = "unet"
     LORA_PREFIX_TEXT_ENCODER = "lora_te"

@@ -108,6 +108,7 @@ class LoConSpecialModule(ToolkitModuleMixin, LoConModule, ExtractableModuleMixin
 
 
 class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
+    TEXT_ENCODER_TARGET_REPLACE_MODULE =["CLIPAttention", "CLIPMLP", "Qwen3Attention", "Qwen3MLP"]
     UNET_TARGET_REPLACE_MODULE = [
         "Transformer2DModel",
         "ResnetBlock2D",
