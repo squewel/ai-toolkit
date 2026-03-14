@@ -483,7 +483,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                     index = None
                     print(f"create LoRA for Text Encoder:")
 
-                replace_modules = LoRANetwork.TEXT_ENCODER_TARGET_REPLACE_MODULE
+                replace_modules = self.TEXT_ENCODER_TARGET_REPLACE_MODULE
 
                 if self.is_pixart:
                     replace_modules = ["T5EncoderModel"]
