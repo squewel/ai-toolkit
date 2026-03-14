@@ -1973,7 +1973,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 # LyCORIS doesnt have default_lr
                 config = {
-                    'text_encoder_lr': self.train_config.lr,
+                    'text_encoder_lr': self.train_config.text_encoder_lr,
                     'unet_lr': self.train_config.lr,
                 }
                 sig = inspect.signature(self.network.prepare_optimizer_params)
@@ -2516,7 +2516,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     else:
                         learning_rate = optimizer.param_groups[0]['lr']
 
-                    prog_bar_string = f"lr: {learning_rate:.1e}"
+                    # Check if we have multiple parameter groups (e.g., DiT and TE)
+                    if len(optimizer.param_groups) > 1:
+                        te_lr = optimizer.param_groups[1]['lr']
+                        prog_bar_string = f"lr: {learning_rate:.1e} te_lr: {te_lr:.1e}"
+                    else:
+                        prog_bar_string = f"lr: {learning_rate:.1e}"
+
                     for key, value in loss_dict.items():
                         prog_bar_string += f" {key}: {value:.3e}"
 
