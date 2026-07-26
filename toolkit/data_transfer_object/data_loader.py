@@ -8,7 +8,6 @@ from PIL.ImageOps import exif_transpose
 import av
             
 from toolkit import image_utils
-from toolkit.basic import get_quick_signature_string
 from toolkit.dataloader_mixins import (
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
@@ -36,6 +35,12 @@ def print_once(msg):
     if msg not in printed_messages:
         print(msg)
         printed_messages.append(msg)
+
+
+# Placeholder written in the signature slot of a size database entry. We never
+# compute or verify file signatures, so nothing reads this back, but keeping the
+# slot preserves the upstream (w, h, signature) entry shape.
+SIZE_DB_SIGNATURE_STUB = None
 
 
 class FileItemDTO(
@@ -74,19 +79,14 @@ class FileItemDTO(
         else:
             file_key = os.path.basename(self.path)
 
-        file_signature = get_quick_signature_string(self.path)
-        if file_signature is None:
-            raise Exception("Error: Could not get file signature for {self.path}")
+        # File signatures are not computed or verified at all. Signing every file
+        # stats the whole dataset on every run, which is wasted time, so a cached
+        # entry is trusted as is and new entries store a stub in the signature
+        # slot. Delete .aitk_size.json to force a rescan if images were resized
+        # in place.
+        db_entry = size_database.get(file_key, None)
+        use_db_entry = db_entry is not None and len(db_entry) >= 2
 
-        use_db_entry = False
-        if file_key in size_database:
-            db_entry = size_database[file_key]
-            if (
-                db_entry is not None
-                and len(db_entry) >= 3
-                and db_entry[2] == file_signature
-            ):
-                use_db_entry = True
         if self.is_audio_model:
             # get the length of the audio file in ms
             with av.open(self.path) as c:
@@ -97,7 +97,7 @@ class FileItemDTO(
                     w = int(float(s.duration * s.time_base) * 1_000)
             h = 1
         elif use_db_entry:
-            w, h, _ = size_database[file_key]
+            w, h = db_entry[0], db_entry[1]
         elif self.is_video:
             # Open the video file
             video = cv2.VideoCapture(self.path)
@@ -113,7 +113,7 @@ class FileItemDTO(
 
             # Release the video capture object immediately
             video.release()
-            size_database[file_key] = (width, height, file_signature)
+            size_database[file_key] = (width, height, SIZE_DB_SIGNATURE_STUB)
         else:
             if self.dataset_config.fast_image_size:
                 # original method is significantly faster, but some images are read sideways. Not sure why. Do slow method by default.
@@ -129,7 +129,7 @@ class FileItemDTO(
             else:
                 img = exif_transpose(Image.open(self.path))
                 w, h = img.size
-            size_database[file_key] = (w, h, file_signature)
+            size_database[file_key] = (w, h, SIZE_DB_SIGNATURE_STUB)
         self.width: int = w
         self.height: int = h
         self.dataloader_transforms = kwargs.get("dataloader_transforms", None)
