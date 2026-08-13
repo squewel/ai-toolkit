@@ -4,6 +4,7 @@ import os
 import random
 import traceback
 from functools import lru_cache
+from itertools import islice
 from typing import List, TYPE_CHECKING
 
 import cv2
@@ -19,7 +20,7 @@ import albumentations as A
 from toolkit import image_utils
 from toolkit.buckets import get_bucket_for_image_size, BucketResolution
 from toolkit.config_modules import DatasetConfig, preprocess_dataset_raw_config
-from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin
+from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin, img_ext_list
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
@@ -560,6 +561,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             print_acc(f"  -  Found {len(self.file_list)} images")
             assert len(self.file_list) > 0, f"no images found in {self.dataset_path}"
 
+        self._validate_masks()
+
         # handle x axis flips
         if self.dataset_config.flip_x:
             print_acc("  -  adding x axis flips")
@@ -587,6 +590,46 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 print_acc(f"  -  Found {len(self.file_list)} images after adding flips")
 
         self.setup_epoch()
+
+    def _validate_masks(self):
+        """Fail fast when `mask_path` is set but the masks are not actually usable.
+
+        A missing mask is SILENT and expensive: the collate fills it with zeros
+        (DataLoaderBatchDTO), so that image contributes ZERO masked loss and, with
+        inverted_mask_prior on, is pinned entirely to the base model. You only find out
+        by wondering why a finished run learned nothing.
+
+        Costs no extra I/O: MaskFileItemDTOMixin.__init__ already resolved each item's
+        mask during the scan above, so this only tallies `has_mask_image`. The directory
+        listing is done ONLY when building an error message.
+        """
+        cfg = self.dataset_config
+        if cfg.mask_path is None or cfg.alpha_mask:
+            return  # nothing configured, or the mask is the image's own alpha channel
+
+        if not os.path.isdir(cfg.mask_path):
+            raise FileNotFoundError(
+                f"mask_path does not exist or is not a directory: {cfg.mask_path}\n"
+                f"  (dataset: {self.dataset_path})")
+
+        # dedupe: num_repeats has already multiplied file_list, so count each image once
+        missing = sorted({os.path.basename(f.path) for f in self.file_list if not f.has_mask_image})
+        total = len({f.path for f in self.file_list})
+        if not missing:
+            print_acc(f"  -  Masks OK: {total}/{total} images have a mask in {cfg.mask_path}")
+            return
+
+        sample = [os.path.splitext(m)[0] for m in missing[:5]]
+        found = [e.name for e in islice(os.scandir(cfg.mask_path), 5)]   # bounded; never lists a huge dir
+        raise FileNotFoundError(
+            f"{len(missing)} of {total} images have NO matching mask in mask_path.\n"
+            f"  dataset  : {self.dataset_path}\n"
+            f"  mask_path: {cfg.mask_path}\n"
+            f"  expected a file named <image stem> + one of {img_ext_list}\n"
+            f"  missing (first 5): {sample}\n"
+            f"  mask_path contains (first 5): {found or '<empty>'}\n"
+            f"  Masks must share the image's basename, e.g. 'foo.jpg' -> 'foo.png'. "
+            f"Fix the folder, or remove mask_path to train unmasked.")
 
     def setup_epoch(self):
         if self.epoch_num == 0:

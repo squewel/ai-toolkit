@@ -562,8 +562,13 @@ class SDTrainer(BaseSDTrainProcess):
                         lat_width = batch.latents.shape[3]
                     # resize to size of noise_pred
                     prior_mask = torch.nn.functional.interpolate(prior_mask, size=(lat_height, lat_width), mode='bicubic')
-                    # stack first channel to match channels of noise_pred
-                    prior_mask = torch.cat([prior_mask[:1]] * noise_pred.shape[1], dim=1)
+                    # stack first channel to match channels of noise_pred.
+                    # NOTE: this must slice the CHANNEL dim (mask_tensor is B,1,H,W), not the batch
+                    # dim. `prior_mask[:1]` yielded (1,C,H,W), which then broadcast over the batch at
+                    # the prior_loss multiply below -- every item silently got image #0's mask. It is
+                    # legal (1-channel mask -> no shape error) so it never surfaced, and it is a no-op
+                    # at batch_size 1, which is why it survived.
+                    prior_mask = torch.cat([prior_mask[:, :1]] * noise_pred.shape[1], dim=1)
                     
                     if len(noise_pred.shape) == 5:
                         prior_mask = prior_mask.unsqueeze(2)  # add time dimension back for video
