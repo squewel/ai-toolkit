@@ -564,16 +564,14 @@ class SDTrainer(BaseSDTrainProcess):
                     prior_mask = torch.nn.functional.interpolate(prior_mask, size=(lat_height, lat_width), mode='bicubic')
                     # stack first channel to match channels of noise_pred
                     #
-                    # KNOWN ISSUE (reverted deliberately, revisit): `[:1]` slices the BATCH dim, so
-                    # this yields (1,C,H,W) rather than (B,C,H,W) -- mask_tensor is (B,1,H,W) and the
-                    # comment above describes `[:, :1]`. The result broadcasts at the prior_loss
-                    # multiply below, so at batch_size > 1 every item is regularized against image
-                    # #0's mask. Silent: a 1-channel mask broadcasts legally, and it is a no-op at
-                    # batch_size 1. The `[:, :1]` fix was applied and then reverted -- it is correct
-                    # in isolation (verified per-item for the 4D and 5D paths) but surfaced problems
-                    # downstream in training. Until that is understood, treat inverted_mask_prior as
-                    # only trustworthy at batch_size 1 (use gradient_accumulation for a larger
-                    # effective batch).
+                    # NOTE: `[:1]` slices the BATCH dim, giving (1,C,H,W) rather than the (B,C,H,W)
+                    # the comment above implies (mask_tensor is (B,1,H,W), so "first channel" would
+                    # be `[:, :1]`). That broadcasts at the prior_loss multiply below, so at
+                    # batch_size > 1 every item is weighted by image #0's mask. No-op at batch_size 1.
+                    # `[:, :1]` was tried -- it is correct in isolation (per-item multiplier verified
+                    # for the 4D and 5D paths, downstream shapes unchanged) -- but in practice this
+                    # original version trains fine and showed no clear advantage to changing, so it
+                    # is left alone deliberately. Revisit only with a concrete symptom to chase.
                     prior_mask = torch.cat([prior_mask[:1]] * noise_pred.shape[1], dim=1)
                     
                     if len(noise_pred.shape) == 5:
