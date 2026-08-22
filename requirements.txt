@@ -1,2 +1,14 @@
 -r requirements_base.txt
-scipy==1.12.0
+
+# scipy is deliberately NOT requested on Python 3.13+.
+#
+# 1.12.0 requires numpy<1.29 (numpy 1.x only). Environments that ship numpy 2.x -- Colab now does --
+# are therefore forced to DOWNGRADE numpy to satisfy this pin, which invalidates every wheel built
+# against numpy 2 and sends the pip resolver backtracking through scikit-learn (via librosa),
+# hanging the install. 1.12.0 also publishes no wheel past cp312, so pip falls back to the 56 MB
+# sdist and dies with `metadata-generation-failed`.
+#
+# Modern environments already ship a compatible scipy (Colab: 1.16.3, which wants numpy<2.6),
+# and scikit-learn pulls scipy transitively regardless, so omitting it changes nothing but the
+# forced downgrade. Environments below 3.13 keep the original pin untouched.
+scipy==1.12.0; python_version < "3.13"
