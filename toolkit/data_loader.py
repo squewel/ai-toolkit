@@ -434,7 +434,25 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             elif self.is_video:
                 # only look for videos
                 extensions = video_extensions
-            file_list = [os.path.join(root, file) for root, _, files in os.walk(self.dataset_path) for file in files if file.lower().endswith(tuple(extensions)) and not file.startswith('.')]
+            # One walk collects BOTH the media files and an index of the caption sidecars
+            # sitting beside them, so _report_captions() below costs no extra stat calls.
+            ext_tuple = tuple(extensions)
+            cap_ext = (self.dataset_config.caption_ext or '.txt').lower()
+            file_list = []
+            self._caption_stems = set()        # path-without-extension -> has its own sidecar
+            self._default_caption_dirs = set() # dirs holding a default.txt / default<ext>
+            for root, _, files in os.walk(self.dataset_path):
+                for file in files:
+                    if file.startswith('.'):
+                        continue
+                    low = file.lower()
+                    if low.endswith(ext_tuple):
+                        file_list.append(os.path.join(root, file))
+                        continue
+                    if low in ('default.txt', f'default{cap_ext}'):
+                        self._default_caption_dirs.add(root)
+                    if low.endswith(cap_ext):
+                        self._caption_stems.add(os.path.join(root, os.path.splitext(file)[0]))
         else:
             # assume json
             with open(self.dataset_path, 'r') as f:
@@ -562,6 +580,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             assert len(self.file_list) > 0, f"no images found in {self.dataset_path}"
 
         self._validate_masks()
+        self._report_captions()
 
         # handle x axis flips
         if self.dataset_config.flip_x:
@@ -590,6 +609,53 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 print_acc(f"  -  Found {len(self.file_list)} images after adding flips")
 
         self.setup_epoch()
+
+    def _report_captions(self):
+        """Diagnostic: how many images actually carry a caption, and where it comes from.
+
+        INFORMATIONAL ONLY -- it never raises. Unlike a missing mask, a missing caption is
+        sometimes deliberate (a dataset-wide `default_caption`, or unconditional training),
+        so this reports rather than blocks. It does warn when images would train on an
+        EMPTY caption, which is nearly always a wrong `caption_ext` or a misplaced folder.
+
+        Costs no extra I/O: the sidecar index is built during the same os.walk that
+        produced file_list.
+        """
+        paths = {f.path for f in self.file_list}   # dedupe: num_repeats already multiplied
+        total = len(paths)
+        if total == 0:
+            return
+
+        if self.caption_dict is not None:
+            own = sum(1 for p in paths if p in self.caption_dict)
+            from_dir, source = 0, f"json ({os.path.basename(self.dataset_path)})"
+        else:
+            stems = getattr(self, '_caption_stems', set())
+            ddirs = getattr(self, '_default_caption_dirs', set())
+            own = from_dir = 0
+            for p in paths:
+                if os.path.splitext(p)[0] in stems:
+                    own += 1
+                elif os.path.dirname(p) in ddirs:
+                    from_dir += 1
+            source = f"'{self.dataset_config.caption_ext}' sidecars"
+
+        missing = total - own - from_dir
+        parts = [f"{own}/{total} from {source}"]
+        if from_dir:
+            parts.append(f"{from_dir} from a folder default")
+        if missing:
+            fallback = self.dataset_config.default_caption
+            parts.append(f"{missing} with none -> "
+                         + (f"default_caption {fallback!r}" if fallback else "EMPTY caption"))
+        print_acc(f"  -  Captions: {' | '.join(parts)}")
+
+        if missing and not self.dataset_config.default_caption:
+            hint = ("those paths are missing from the json"
+                    if self.caption_dict is not None else
+                    f"check caption_ext (currently '{self.dataset_config.caption_ext}') and that "
+                    f"the caption files sit beside the images with matching basenames")
+            print_acc(f"     WARNING: {missing} image(s) will train on an EMPTY caption -- {hint}.")
 
     def _validate_masks(self):
         """Fail fast when `mask_path` is set but the masks are not actually usable.
