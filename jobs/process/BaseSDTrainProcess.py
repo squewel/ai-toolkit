@@ -174,7 +174,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.datasets = []
                     self.datasets.append(dataset)
                 self.dataset_configs.append(dataset)
-        
+            self._report_trigger_pairs()
+
         self.is_caching_text_embeddings = any(
             dataset.cache_text_embeddings for dataset in self.dataset_configs
         )
@@ -269,6 +270,34 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.additional_logs = {}
         # cached latents, prompt embeds, and fixed noise for validation
         self._validation_cache = None
+
+    def _report_trigger_pairs(self):
+        """Startup report for trigger_pairs, so the log shows whether the random pairs are actually in
+        use. Prints nothing when no training dataset uses them (the default fixed-trigger case)."""
+        train_sets = [d for d in self.dataset_configs if not d.is_reg]
+        if not any(d.trigger_pairs for d in train_sets):
+            return
+        dop = self.train_config.diff_output_preservation
+        print_acc(
+            "Trigger pairs: one random {trigger -> class} pair per sample, re-picked every time it loads"
+            + (" | DOP on: each sample's class comes from its pair (diff_output_preservation_class is ignored)"
+               if dop else " | DOP off: only the trigger is used")
+        )
+        print_acc(f"  -  Sample prompts still use trigger_word: {self.trigger_word!r}")
+        printed = []
+        for d in train_sets:
+            name = d.folder_path or d.dataset_path
+            if not d.trigger_pairs:
+                print_acc(f"  -  {name}: no pairs, fixed trigger_word {d.trigger_word!r}")
+                continue
+            source = "train.trigger_pairs" if d.trigger_pairs is self.train_config.trigger_pairs else "own trigger_pairs"
+            print_acc(f"  -  {name}: {len(d.trigger_pairs)} pairs ({source})")
+            if d.trigger_pairs not in printed:
+                printed.append(d.trigger_pairs)
+                for trigger, cls in d.trigger_pairs:
+                    print_acc(f"       {trigger!r} -> {cls!r}" if dop else f"       {trigger!r}")
+        if any(d.trigger_pairs for d in self.dataset_configs if d.is_reg):
+            print_acc("  -  Regularization datasets never use pairs")
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
