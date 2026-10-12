@@ -320,6 +320,9 @@ class CaptionProcessingDTOMixin:
             dataset_config: DatasetConfig = kwargs.get('dataset_config', None)
             self.extra_values: List[float] = dataset_config.extra_values
             self.trigger_word = dataset_config.trigger_word
+            self.trigger_pairs = getattr(dataset_config, 'trigger_pairs', None)
+            # (trigger, class) picked for THIS load of the sample; None when trigger_pairs is unset or reg
+            self.trigger_pair = None
 
     # todo allow for loading from sd-scripts style dict
     def load_caption(self: 'FileItemDTO', caption_dict: Union[dict, None]=None):
@@ -359,6 +362,10 @@ class CaptionProcessingDTOMixin:
             self.raw_caption = prompt
             self.raw_caption_short = short_caption
 
+        # trigger_pairs: one random pair per load (the item is re-loaded on every fetch), shared by the
+        # long and short caption so both carry the same trigger
+        if self.trigger_pairs and not self.is_reg:
+            self.trigger_pair = random.choice(self.trigger_pairs)
         self.caption = self.get_caption()
         if self.raw_caption_short is not None:
             self.caption_short = self.get_caption(short_caption=True)
@@ -370,9 +377,11 @@ class CaptionProcessingDTOMixin:
             add_if_not_present=False,
             short_caption=False
     ):
+        if trigger is None and self.trigger_pair is not None:
+            trigger = self.trigger_pair[0]
         if trigger is None and self.trigger_word is not None:
             trigger = self.trigger_word
-        
+
         if trigger is not None and not self.is_reg:
             # add if not present if not regularization
             add_if_not_present = True

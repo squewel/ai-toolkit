@@ -160,6 +160,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # handle trigger word per dataset
                 if dataset.trigger_word is None and self.trigger_word is not None:
                     dataset.trigger_word = self.trigger_word
+                if dataset.trigger_pairs is None and self.train_config.trigger_pairs is not None:
+                    dataset.trigger_pairs = self.train_config.trigger_pairs
                 is_caching = dataset.cache_latents or dataset.cache_latents_to_disk
                 if not is_caching:
                     self.is_latents_cached = False
@@ -1028,6 +1030,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             with self.timer('prepare_prompt'):
                 prompts = batch.get_caption_list()
                 is_reg_list = batch.get_is_reg_list()
+                # per-prompt (trigger, class) when trigger_pairs is set; kept aligned with prompts below
+                trigger_pair_list = batch.get_trigger_pair_list()
 
                 is_any_reg = any([is_reg for is_reg in is_reg_list])
 
@@ -1039,13 +1043,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # double batch and add short captions to the end
                     prompts = prompts + batch.get_caption_short_list()
                     is_reg_list = is_reg_list + is_reg_list
+                    trigger_pair_list = trigger_pair_list + trigger_pair_list
                 if self.model_config.refiner_name_or_path is not None and self.train_config.train_unet:
                     prompts = prompts + prompts
                     is_reg_list = is_reg_list + is_reg_list
+                    trigger_pair_list = trigger_pair_list + trigger_pair_list
 
                 conditioned_prompts = []
+                # aligned 1:1 with conditioned_prompts; read by the DOP prompt builder
+                batch.conditioned_trigger_pairs = trigger_pair_list
 
-                for prompt, is_reg in zip(prompts, is_reg_list):
+                for prompt, is_reg, trigger_pair in zip(prompts, is_reg_list, trigger_pair_list):
 
                     # make sure the embedding is in the prompts
                     if self.embedding is not None:
@@ -1062,11 +1070,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             add_if_not_present=not is_reg,
                         )
 
-                    # make sure trigger is in the prompts if not a regularization run
-                    if self.trigger_word is not None:
+                    # make sure trigger is in the prompts if not a regularization run.
+                    # With trigger_pairs, use the sample's own picked trigger: the global one would be
+                    # "missing" from e.g. a "@x female" caption and get prepended a second time.
+                    sample_trigger = trigger_pair[0] if trigger_pair is not None else self.trigger_word
+                    if sample_trigger is not None:
                         prompt = self.sd.inject_trigger_into_prompt(
                             prompt,
-                            trigger=self.trigger_word,
+                            trigger=sample_trigger,
                             add_if_not_present=not is_reg,
                         )
 

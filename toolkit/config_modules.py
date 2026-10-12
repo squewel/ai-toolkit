@@ -372,6 +372,26 @@ ContentOrStyleType = Literal['balanced', 'style', 'content']
 LossTarget = Literal['noise', 'source', 'unaugmented', 'differential_noise']
 
 
+def parse_trigger_pairs(raw) -> Optional[List[Tuple[str, str]]]:
+    """trigger_pairs config -> [(trigger, class), ...]. Accepts {trigger, class} dicts or 2-item lists."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)) or len(raw) == 0:
+        raise ValueError("trigger_pairs must be a non-empty list of {trigger, class} pairs")
+    pairs = []
+    for item in raw:
+        if isinstance(item, dict):
+            trigger, cls = item.get('trigger'), item.get('class')
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            trigger, cls = item
+        else:
+            raise ValueError(f"trigger_pairs entry must be {{trigger, class}} or [trigger, class], got {item!r}")
+        if not isinstance(trigger, str) or not trigger.strip() or not isinstance(cls, str):
+            raise ValueError(f"trigger_pairs entry needs a non-empty string trigger and a string class, got {item!r}")
+        pairs.append((trigger, cls))
+    return pairs
+
+
 class TrainConfig:
     def __init__(self, **kwargs):
         self.noise_scheduler = kwargs.get('noise_scheduler', 'ddpm')
@@ -491,7 +511,13 @@ class TrainConfig:
         self.diff_output_preservation_multiplier = kwargs.get('diff_output_preservation_multiplier', 1.0)
         # If the trigger word is in the prompt, we will use this class name to replace it eg. "sks woman" -> "woman"
         self.diff_output_preservation_class = kwargs.get('diff_output_preservation_class', '')
-        
+        # Optional alternative to the fixed trigger_word / diff_output_preservation_class pair: a list of
+        # {trigger, class} pairs. Each time a sample is loaded, ONE pair is picked at random; its trigger
+        # replaces [trigger] in that sample's caption and, with DOP on, exactly that trigger is replaced by
+        # the pair's class in that sample's preservation prompt. Unset (default) = the fixed pair.
+        # trigger_word is still used for sample prompts and metadata.
+        self.trigger_pairs: Optional[List[Tuple[str, str]]] = parse_trigger_pairs(kwargs.get('trigger_pairs', None))
+
         # blank prompt preservation will preserve the model's knowledge of a blank prompt
         self.blank_prompt_preservation = kwargs.get('blank_prompt_preservation', False)
         self.blank_prompt_preservation_multiplier = kwargs.get('blank_prompt_preservation_multiplier', 1.0)
@@ -915,6 +941,8 @@ class DatasetConfig:
         self.default_caption: str = kwargs.get('default_caption', None)
         # trigger word for just this dataset
         self.trigger_word: str = kwargs.get('trigger_word', None)
+        # random {trigger, class} pairs; filled from train.trigger_pairs by the train process
+        self.trigger_pairs: Optional[List[Tuple[str, str]]] = parse_trigger_pairs(kwargs.get('trigger_pairs', None))
         random_triggers = kwargs.get('random_triggers', [])
         # if they are a string, load them from a file
         if isinstance(random_triggers, str) and os.path.exists(random_triggers):

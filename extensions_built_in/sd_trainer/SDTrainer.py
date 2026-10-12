@@ -85,8 +85,8 @@ class SDTrainer(BaseSDTrainProcess):
         self.unconditional_embeds = None
         
         if self.train_config.diff_output_preservation:
-            if self.trigger_word is None:
-                raise ValueError("diff_output_preservation requires a trigger_word to be set")
+            if self.trigger_word is None and self.train_config.trigger_pairs is None:
+                raise ValueError("diff_output_preservation requires a trigger_word (or trigger_pairs) to be set")
             if self.network_config is None:
                 raise ValueError("diff_output_preservation requires a network to be set")
             if self.train_config.train_text_encoder:
@@ -112,6 +112,16 @@ class SDTrainer(BaseSDTrainProcess):
 
     def before_model_load(self):
         pass
+
+    def get_dop_prompts(self, prompts, trigger_pairs=None):
+        """DOP prompts: the trigger swapped for its class. trigger_pairs=None -> the fixed
+        trigger_word / diff_output_preservation_class pair (original behaviour); otherwise each prompt's
+        own picked (trigger, class) -- never a guess from the text. None entries (reg) pass through."""
+        if trigger_pairs is None:
+            return [p.replace(self.trigger_word, self.train_config.diff_output_preservation_class) for p in prompts]
+        if len(trigger_pairs) != len(prompts):
+            raise ValueError(f"trigger_pairs: {len(trigger_pairs)} pairs for {len(prompts)} prompts")
+        return [p if pair is None else p.replace(pair[0], pair[1]) for p, pair in zip(prompts, trigger_pairs)]
     
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
@@ -1488,6 +1498,16 @@ class SDTrainer(BaseSDTrainProcess):
             prompts_1 = batch.get_caption_short_list()
             prompts_2 = conditioned_prompts
 
+        # trigger_pairs: the (trigger, class) each prompt was built with, aligned 1:1 with prompts_1 /
+        # prompts_2 and split exactly like them, so DOP replaces each sample's own trigger
+        trigger_pairs_1 = None
+        trigger_pairs_2 = None
+        if self.train_config.trigger_pairs is not None:
+            trigger_pairs_1 = batch.conditioned_trigger_pairs
+            if prompts_2 is not None:
+                trigger_pairs_1 = batch.get_trigger_pair_list()  # prompts_1 = the short captions
+                trigger_pairs_2 = batch.conditioned_trigger_pairs
+
             # make the batch splits
         if self.train_config.single_item_batching:
             if self.model_config.refiner_name_or_path is not None:
@@ -1515,6 +1535,8 @@ class SDTrainer(BaseSDTrainProcess):
                 prompt_2_list = [None for _ in range(batch_size)]
             else:
                 prompt_2_list = [[prompt] for prompt in prompts_2]
+            trigger_pairs_1_list = [None for _ in range(batch_size)] if trigger_pairs_1 is None else [[p] for p in trigger_pairs_1]
+            trigger_pairs_2_list = [None for _ in range(batch_size)] if trigger_pairs_2 is None else [[p] for p in trigger_pairs_2]
 
         else:
             noisy_latents_list = [noisy_latents]
@@ -1529,8 +1551,10 @@ class SDTrainer(BaseSDTrainProcess):
                 prompt_2_list = [None]
             else:
                 prompt_2_list = [prompts_2]
+            trigger_pairs_1_list = [trigger_pairs_1]
+            trigger_pairs_2_list = [trigger_pairs_2]
 
-        for noisy_latents, noise, timesteps, conditioned_prompts, imgs, adapter_images, clip_images, mask_multiplier, prompt_2 in zip(
+        for noisy_latents, noise, timesteps, conditioned_prompts, imgs, adapter_images, clip_images, mask_multiplier, prompt_2, prompt_trigger_pairs, prompt_2_trigger_pairs in zip(
                 noisy_latents_list,
                 noise_list,
                 timesteps_list,
@@ -1539,7 +1563,9 @@ class SDTrainer(BaseSDTrainProcess):
                 adapter_images_list,
                 clip_images_list,
                 mask_multiplier_list,
-                prompt_2_list
+                prompt_2_list,
+                trigger_pairs_1_list,
+                trigger_pairs_2_list,
         ):
 
             # if self.train_config.negative_prompt is not None:
@@ -1683,10 +1709,10 @@ class SDTrainer(BaseSDTrainProcess):
                                     self.adapter.is_unconditional_run = False
                             
                             if self.train_config.diff_output_preservation:
-                                dop_prompts = [p.replace(self.trigger_word, self.train_config.diff_output_preservation_class) for p in conditioned_prompts]
+                                dop_prompts = self.get_dop_prompts(conditioned_prompts, prompt_trigger_pairs)
                                 dop_prompts_2 = None
                                 if prompt_2 is not None:
-                                    dop_prompts_2 = [p.replace(self.trigger_word, self.train_config.diff_output_preservation_class) for p in prompt_2]
+                                    dop_prompts_2 = self.get_dop_prompts(prompt_2, prompt_2_trigger_pairs)
                                 self.diff_output_preservation_embeds = self.sd.encode_prompt(
                                     dop_prompts, dop_prompts_2,
                                     dropout_prob=self.train_config.prompt_dropout_prob,

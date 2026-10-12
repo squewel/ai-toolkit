@@ -452,6 +452,10 @@ class DataLoaderBatchDTO:
     ):
         return [x.caption for x in self.file_items]
 
+    def get_trigger_pair_list(self):
+        """(trigger, class) picked for each item's caption, or None (trigger_pairs unset / reg item)."""
+        return [getattr(x, 'trigger_pair', None) for x in self.file_items]
+
     def get_caption_short_list(
         self, trigger=None, to_replace_list=None, add_if_not_present=True
     ):
