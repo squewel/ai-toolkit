@@ -1,3 +1,4 @@
+import math
 import os
 import time
 from typing import List, Optional, Literal, Tuple, Union, TYPE_CHECKING, Dict
@@ -392,6 +393,71 @@ def parse_trigger_pairs(raw) -> Optional[List[Tuple[str, str]]]:
     return pairs
 
 
+# train settings a timestep_custom_distr replaces; the ones present in the config are reported as ignored
+TIMESTEP_CUSTOM_DISTR_OVERRIDES = (
+    'timestep_type', 'content_or_style', 'linear_timesteps', 'linear_timesteps2', 'next_sample_timesteps'
+)
+
+
+def parse_timestep_custom_distr(raw) -> Optional[List[Tuple[float, float]]]:
+    """timestep_custom_distr config -> [(timestep, relative probability), ...] keypoints.
+
+    Timesteps run 0 (noisiest) .. 1000 (clean), the min/max_denoising_steps direction, and must be in
+    order; a repeated timestep is a hard step. Probabilities are relative, so they needn't sum to 1."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)) or len(raw) == 0:
+        raise ValueError("timestep_custom_distr must be a non-empty list of [timestep, probability] pairs")
+
+    def number(value, item):
+        try:
+            if isinstance(value, bool):
+                raise TypeError
+            value = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"timestep_custom_distr entry must be two numbers [timestep, probability], got {item!r}")
+        if not math.isfinite(value):
+            raise ValueError(f"timestep_custom_distr entry must be finite, got {item!r}")
+        return value
+
+    points = []
+    previous = None
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError(f"timestep_custom_distr entry must be [timestep, probability], got {item!r}")
+        timestep, probability = number(item[0], item), number(item[1], item)
+        if not 0 <= timestep <= 1000:
+            raise ValueError(f"timestep_custom_distr timestep must be in [0, 1000], got {item!r}")
+        if probability < 0:
+            raise ValueError(f"timestep_custom_distr probability can't be negative, got {item!r}")
+        if points and timestep < points[-1][0]:
+            raise ValueError(f"timestep_custom_distr timesteps must be sorted ascending: {item!r} comes after {previous!r}")
+        points.append((timestep, probability))
+        previous = item
+    return points
+
+
+def timestep_custom_distr_weights(points: List[Tuple[float, float]], num_timesteps: int) -> List[float]:
+    """Relative probability of each timestep index, 0 = noisiest .. num_timesteps - 1 = clean.
+
+    Index i sits at i * 1000 / (num_timesteps - 1) on the keypoint scale, so 1000 is always the cleanest
+    index. Linear between keypoints, flat before the first and after the last; at a repeated timestep
+    the later keypoint wins."""
+    weights = []
+    for i in range(num_timesteps):
+        x = i * 1000 / max(num_timesteps - 1, 1)
+        if x < points[0][0]:
+            weights.append(points[0][1])
+        elif x >= points[-1][0]:
+            weights.append(points[-1][1])
+        else:
+            for (t0, p0), (t1, p1) in zip(points, points[1:]):
+                if t0 <= x < t1:
+                    weights.append(p0 + (x - t0) / (t1 - t0) * (p1 - p0))
+                    break
+    return weights
+
+
 class TrainConfig:
     def __init__(self, **kwargs):
         self.noise_scheduler = kwargs.get('noise_scheduler', 'ddpm')
@@ -583,6 +649,33 @@ class TrainConfig:
         self.next_sample_timesteps = kwargs.get('next_sample_timesteps', 8)
         self.linear_timesteps = kwargs.get('linear_timesteps', False)
         self.linear_timesteps2 = kwargs.get('linear_timesteps2', False)
+
+        # Optional custom timestep distribution: keypoints [[timestep, relative probability], ...] on the
+        # min/max_denoising_steps scale (0 = noisiest, 1000 = clean), linear between keypoints and flat
+        # outside them, e.g. [[0, 0], [100, 0.5], [500, 1], [1000, 0]]. When set it replaces ALL other
+        # timestep scheduling: every step (reg included) samples from this curve over a linear schedule
+        # with no timestep loss weighting. The settings it replaces are reset here, and the values the
+        # config had are kept for the startup report.
+        self.timestep_custom_distr: Optional[List[Tuple[float, float]]] = parse_timestep_custom_distr(
+            kwargs.get('timestep_custom_distr', None)
+        )
+        self.timestep_custom_distr_ignored: Dict[str, object] = {}
+        if self.timestep_custom_distr is not None:
+            clash = [k for k in ('min_denoising_steps', 'max_denoising_steps') if kwargs.get(k) is not None]
+            if clash:
+                raise ValueError(
+                    f"timestep_custom_distr can't be combined with {' / '.join(clash)}: "
+                    "write a range cutoff as zero-probability keypoints instead"
+                )
+            if sum(timestep_custom_distr_weights(self.timestep_custom_distr, self.num_train_timesteps)) <= 0:
+                raise ValueError("timestep_custom_distr gives every timestep zero probability")
+            self.timestep_custom_distr_ignored = {
+                k: kwargs[k] for k in TIMESTEP_CUSTOM_DISTR_OVERRIDES if kwargs.get(k) is not None
+            }
+            self.timestep_type = 'linear'
+            self.content_or_style = self.content_or_style_reg = 'balanced'
+            self.linear_timesteps = self.linear_timesteps2 = False
+
         self.disable_sampling = kwargs.get('disable_sampling', False)
 
         # will cache a blank prompt or the trigger word, and unload the text encoder to cpu

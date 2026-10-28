@@ -63,7 +63,7 @@ from tqdm import tqdm
 
 from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, NetworkConfig, TrainConfig, ModelConfig, \
     GenerateImageConfig, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
-    DecoratorConfig
+    DecoratorConfig, timestep_custom_distr_weights
 from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
 from toolkit.accelerator import get_accelerator, unwrap_model
@@ -175,6 +175,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     self.datasets.append(dataset)
                 self.dataset_configs.append(dataset)
             self._report_trigger_pairs()
+        self._report_timestep_custom_distr()
+        # per-index sampling weights for timestep_custom_distr, built on the first training step
+        self._timestep_custom_distr_cache: Optional[torch.Tensor] = None
 
         self.is_caching_text_embeddings = any(
             dataset.cache_text_embeddings for dataset in self.dataset_configs
@@ -298,6 +301,44 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"       {trigger!r} -> {cls!r}" if dop else f"       {trigger!r}")
         if any(d.trigger_pairs for d in self.dataset_configs if d.is_reg):
             print_acc("  -  Regularization datasets never use pairs")
+
+    def _report_timestep_custom_distr(self):
+        """Startup report for timestep_custom_distr: the keypoints, the timestep settings it overrides and
+        the resulting share of steps per 100-timestep band. Prints nothing when it isn't set."""
+        points = self.train_config.timestep_custom_distr
+        if points is None:
+            return
+        if self.model_config.refiner_name_or_path is not None:
+            raise ValueError("timestep_custom_distr isn't supported with a refiner (model.refiner_name_or_path)")
+        print_acc(
+            "Timestep custom distribution: replaces all other timestep sampling and timestep loss weighting, "
+            "reg images included (0 = noisiest, 1000 = clean)"
+        )
+        print_acc("  -  keypoints: " + " ".join(f"[{t:g}, {p:g}]" for t, p in points))
+        ignored = self.train_config.timestep_custom_distr_ignored
+        if ignored:
+            print_acc("  -  ignored: " + ", ".join(f"{k}: {v!r}" for k, v in ignored.items()))
+        num_timesteps = self.train_config.num_train_timesteps
+        weights = timestep_custom_distr_weights(points, num_timesteps)
+        total = sum(weights)
+        shares = [0.0] * 10
+        for i, w in enumerate(weights):
+            shares[min(int(i * 1000 / max(num_timesteps - 1, 1) // 100), 9)] += w / total
+        print_acc("  -  share of steps: " + " | ".join(
+            f"{b * 100}-{b * 100 + 100} {s:.1%}" for b, s in enumerate(shares)
+        ))
+
+    def _timestep_custom_distr_weights(self) -> torch.Tensor:
+        # one weight per entry of the scheduler's training timesteps, so sampled indices are always valid
+        num_timesteps = len(self.sd.noise_scheduler.timesteps)
+        cache = self._timestep_custom_distr_cache
+        if cache is None or cache.shape[0] != num_timesteps:
+            cache = torch.tensor(
+                timestep_custom_distr_weights(self.train_config.timestep_custom_distr, num_timesteps),
+                dtype=torch.float32, device=self.device_torch
+            )
+            self._timestep_custom_distr_cache = cache
+        return cache
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
@@ -1281,7 +1322,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if is_reg:
                     content_or_style = self.train_config.content_or_style_reg
 
-                if self.train_config.timestep_type in ['two_step', 'four_step', 'eight_step']:
+                if self.train_config.timestep_custom_distr is not None:
+                    # TrainConfig reset every other timestep setting, so this is the only sampler in play
+                    timestep_indices = torch.multinomial(
+                        self._timestep_custom_distr_weights(), batch_size, replacement=True
+                    )
+                elif self.train_config.timestep_type in ['two_step', 'four_step', 'eight_step']:
                     if self.train_config.timestep_type == 'two_step':
                         indice_choices = [0, 499]
                     elif self.train_config.timestep_type == 'four_step':
@@ -1834,7 +1880,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.hook_after_sd_init_before_load()
         # run base sd process run
         self.sd.load_model()
-        
+        if self.train_config.timestep_custom_distr is not None and self.sd.is_multistage:
+            raise ValueError(
+                "timestep_custom_distr isn't supported for multi-stage models: each stage trains a fixed timestep range"
+            )
+
         self.sd.add_after_sample_image_hook(self.sample_step_hook)
 
         dtype = get_torch_dtype(self.train_config.dtype)
