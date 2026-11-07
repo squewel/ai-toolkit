@@ -567,25 +567,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def end_step_hook(self):
         pass
 
-    def save(self, step=None):
-        if not self.accelerator.is_main_process:
-            return
-        flush()
-        if self.ema is not None:
-            # always save params as ema
-            self.ema.eval()
-
-        if not os.path.exists(self.save_root):
-            os.makedirs(self.save_root, exist_ok=True)
-
-        step_num = ''
-        if step is not None:
-            self.last_save_step = step
-            # zeropad 9 digits
-            step_num = f"_{str(step).zfill(9)}"
-
-        self.update_training_metadata()
-        filename = f'{self.job.name}{step_num}.safetensors'
+    def _save_weights(self, step_num, suffix=''):
+        # writes the trained weights in their current state. suffix (e.g. '_ema')
+        # goes between the step number and the extension.
+        filename = f'{self.job.name}{step_num}{suffix}.safetensors'
         file_path = os.path.join(self.save_root, filename)
 
         save_meta = copy.deepcopy(self.meta)
@@ -605,7 +590,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # add _lora to name
                     lora_name += '_LoRA'
 
-                filename = f'{lora_name}{step_num}.safetensors'
+                filename = f'{lora_name}{step_num}{suffix}.safetensors'
                 file_path = os.path.join(self.save_root, filename)
                 prev_multiplier = self.network.multiplier
                 self.network.multiplier = 1.0
@@ -623,7 +608,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
             # even if added to lora, still save the trigger version
             if self.embedding is not None:
-                emb_filename = f'{self.embed_config.trigger}{step_num}.safetensors'
+                emb_filename = f'{self.embed_config.trigger}{step_num}{suffix}.safetensors'
                 emb_file_path = os.path.join(self.save_root, emb_filename)
                 # for combo, above will get it
                 # set current step
@@ -635,7 +620,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.embedding.save(emb_file_path)
             
             if self.decorator is not None:
-                dec_filename = f'{self.job.name}{step_num}.safetensors'
+                dec_filename = f'{self.job.name}{step_num}{suffix}.safetensors'
                 dec_file_path = os.path.join(self.save_root, dec_filename)
                 decorator_state_dict = self.decorator.state_dict()
                 for key, value in decorator_state_dict.items():
@@ -662,7 +647,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     else:
                         adapter_name += '_adapter'
 
-                filename = f'{adapter_name}{step_num}.safetensors'
+                filename = f'{adapter_name}{step_num}{suffix}.safetensors'
                 file_path = os.path.join(self.save_root, filename)
                 # save adapter
                 state_dict = self.adapter.state_dict()
@@ -735,7 +720,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.sd.refiner_unet and self.train_config.train_refiner:
                 # save refiner
                 refiner_name = self.job.name + '_refiner'
-                filename = f'{refiner_name}{step_num}.safetensors'
+                filename = f'{refiner_name}{step_num}{suffix}.safetensors'
                 file_path = os.path.join(self.save_root, filename)
                 self.sd.save_refiner(
                     file_path,
@@ -749,6 +734,31 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     get_torch_dtype(self.save_config.dtype)
                 )
 
+        print_acc(f"Saved checkpoint to {file_path}")
+        return file_path
+
+    def save(self, step=None):
+        if not self.accelerator.is_main_process:
+            return
+        flush()
+
+        if not os.path.exists(self.save_root):
+            os.makedirs(self.save_root, exist_ok=True)
+
+        step_num = ''
+        if step is not None:
+            self.last_save_step = step
+            # zeropad 9 digits
+            step_num = f"_{str(step).zfill(9)}"
+
+        self.update_training_metadata()
+        file_path = self._save_weights(step_num)
+        if self.ema is not None:
+            # also save the EMA weights next to the raw ones, with an _ema suffix
+            self.ema.eval()
+            self._save_weights(step_num, suffix='_ema')
+            self.ema.train()
+
         # save learnable params as json if we have thim
         if self.snr_gos:
             json_data = {
@@ -760,8 +770,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
             path_to_save = file_path = os.path.join(self.save_root, 'learnable_snr.json')
             with open(path_to_save, 'w') as f:
                 json.dump(json_data, f, indent=4)
-        
-        print_acc(f"Saved checkpoint to {file_path}")
 
         # save optimizer
         if self.optimizer is not None:
@@ -780,9 +788,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         self.clean_up_saves()
         self.post_save_hook(file_path)
-
-        if self.ema is not None:
-            self.ema.train()
         flush()
 
     # Called before the model is loaded
@@ -911,6 +916,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     paths = [p for p in paths if '_t2i' not in p]
                 if '_cn' not in name:
                     paths = [p for p in paths if '_cn' not in p]
+                # resume from the raw weights, never from the _ema copies
+                if not name.endswith('_ema'):
+                    paths = [p for p in paths if not os.path.splitext(p)[0].endswith('_ema')]
 
                 if len(paths) > 0:
                     latest_path = max(paths, key=os.path.getctime)
