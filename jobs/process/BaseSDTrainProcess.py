@@ -30,7 +30,7 @@ from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.data_loader import get_dataloader_from_datasets, trigger_dataloader_setup_epoch
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
-from toolkit.ema import ExponentialMovingAverage
+from toolkit.ema import ExponentialMovingAverage, ema_file_suffix
 from toolkit.embedding import Embedding
 from toolkit.image_utils import show_tensors, show_latents, reduce_contrast
 from toolkit.ip_adapter import IPAdapter
@@ -255,6 +255,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.embed_config is not None or is_training_adapter:
             self.named_lora = True
         self.snr_gos: Union[LearnableSNRGamma, None] = None
+        # one (file suffix, EMA) per ema_decay. self.ema is the first one, used for sampling
+        self.emas: List[tuple] = []
         self.ema: ExponentialMovingAverage = None
         
         validate_configs(self.train_config, self.model_config, self.save_config, self.dataset_configs)
@@ -753,11 +755,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         self.update_training_metadata()
         file_path = self._save_weights(step_num)
-        if self.ema is not None:
-            # also save the EMA weights next to the raw ones, with an _ema suffix
-            self.ema.eval()
-            self._save_weights(step_num, suffix='_ema')
-            self.ema.train()
+        # also save each EMA next to the raw weights, e.g. _ema998. eval() swaps the
+        # EMA weights in, train() puts the raw weights back before the next one.
+        for suffix, ema in self.emas:
+            ema.eval()
+            self._save_weights(step_num, suffix=suffix)
+            ema.train()
 
         # save learnable params as json if we have thim
         if self.snr_gos:
@@ -865,12 +868,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
             for group in self.optimizer.param_groups:
                 for param in group['params']:
                     params.append(param)
-            self.ema = ExponentialMovingAverage(
-                params,
-                decay=self.train_config.ema_config.ema_decay,
-                use_feedback=self.train_config.ema_config.use_feedback,
-                param_multiplier=self.train_config.ema_config.param_multiplier,
-            )
+            for decay in self.train_config.ema_config.ema_decays:
+                ema = ExponentialMovingAverage(
+                    params,
+                    decay=decay,
+                    use_feedback=self.train_config.ema_config.use_feedback,
+                    param_multiplier=self.train_config.ema_config.param_multiplier,
+                )
+                self.emas.append((ema_file_suffix(decay), ema))
+            self.ema = self.emas[0][1]
 
     def before_dataset_load(self):
         pass
@@ -916,9 +922,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     paths = [p for p in paths if '_t2i' not in p]
                 if '_cn' not in name:
                     paths = [p for p in paths if '_cn' not in p]
-                # resume from the raw weights, never from the _ema copies
-                if not name.endswith('_ema'):
-                    paths = [p for p in paths if not os.path.splitext(p)[0].endswith('_ema')]
+                # resume from the raw weights, never from the _ema / _ema998 copies
+                if not re.search(r'_ema\d*$', name):
+                    paths = [p for p in paths if not re.search(r'_ema\d*$', os.path.splitext(p)[0])]
 
                 if len(paths) > 0:
                     latest_path = max(paths, key=os.path.getctime)

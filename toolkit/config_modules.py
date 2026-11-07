@@ -935,7 +935,12 @@ class ModelConfig:
 class EMAConfig:
     def __init__(self, **kwargs):
         self.use_ema: bool = kwargs.get('use_ema', False)
-        self.ema_decay: float = kwargs.get('ema_decay', 0.999)
+        # a single decay, or a list of decays to track several EMAs in one run.
+        # each gets its own checkpoint, e.g. 0.998 -> job_000001000_ema998.safetensors
+        ema_decay = kwargs.get('ema_decay', 0.999)
+        decays = ema_decay if isinstance(ema_decay, (list, tuple)) else [ema_decay]
+        self.ema_decays: List[float] = list(dict.fromkeys(float(d) for d in decays))
+        self.ema_decay: float = self.ema_decays[0]
         # feeds back the decay difference into the parameter
         self.use_feedback: bool = kwargs.get('use_feedback', False)
         

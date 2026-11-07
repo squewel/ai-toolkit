@@ -10,6 +10,12 @@ from toolkit.optimizers.optimizer_utils import copy_stochastic
 import torch
 
 
+def ema_file_suffix(decay: float) -> str:
+    # checkpoint name suffix for an EMA, e.g. 0.998 -> '_ema998'. No dot, so it
+    # doesn't get mistaken for part of the file extension.
+    return '_ema' + repr(float(decay)).replace('0.', '', 1).replace('.', '')
+
+
 # Partially based on:
 # https://github.com/tensorflow/tensorflow/blob/r1.13/tensorflow/python/training/moving_averages.py
 class ExponentialMovingAverage:
