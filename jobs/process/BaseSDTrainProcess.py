@@ -258,7 +258,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # one (file suffix, EMA) per ema_decay. self.ema is the first one, used for sampling
         self.emas: List[tuple] = []
         self.ema: ExponentialMovingAverage = None
-        
+        # raw network checkpoint this run resumed from; its _emaNNN siblings seed the EMAs
+        self._network_resume_path: Optional[str] = None
+
         validate_configs(self.train_config, self.model_config, self.save_config, self.dataset_configs)
         
         do_profiler = self.get_conf('torch_profiler', False)
@@ -877,6 +879,79 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 )
                 self.emas.append((ema_file_suffix(decay), ema))
             self.ema = self.emas[0][1]
+
+    def restore_emas_from_checkpoint(self):
+        """On resume, continue each EMA from the file saved with it instead of restarting it.
+
+        save() writes each EMA next to the raw weights (job_000001500.safetensors ->
+        job_000001500_ema998.safetensors). For every decay in the config, the file with that decay's
+        suffix next to the raw checkpoint we resumed from is loaded into the EMA. A decay with no such
+        file (added to the config since, or saved before EMAs were written) starts from the raw
+        weights, which is what every EMA did before this.
+
+        The file is read through network.load_weights, so it gets exactly the key handling the raw
+        resume got. Those files hold network weights only: any other trained param in the EMA
+        (embedding, adapter, ...) starts from its raw value.
+        """
+        resume_path = self._network_resume_path
+        if not self.emas or resume_path is None or self.network is None:
+            return
+
+        base, ext = os.path.splitext(resume_path)
+        if ext != '.safetensors':
+            print_acc(f"EMA resume: {resume_path} is not a .safetensors file, EMAs start from the raw weights")
+            return
+
+        print_acc(f"EMA resume: looking for EMA checkpoints next to {os.path.basename(resume_path)}")
+        raw_step = load_metadata_from_safetensors(resume_path).get('training_info', {}).get('step')
+        network_param_ids = {id(p) for p in self.network.parameters()}
+
+        outside = sum(1 for p in self.ema._get_parameters(None) if id(p) not in network_param_ids)
+        if outside:
+            print_acc(f"  -  {outside} trained params are outside the network and not in the EMA files; "
+                      "their EMAs start from the raw values")
+
+        # the raw weights, put back once every EMA file has been read through the network
+        raw_state = {k: v.detach().to('cpu', copy=True) for k, v in self.network.state_dict().items()}
+        try:
+            for suffix, ema in self.emas:
+                label = f"EMA {ema.decay:g}"
+                ema_path = f"{base}{suffix}{ext}"
+                ema_name = os.path.basename(ema_path)
+                if not os.path.exists(ema_path):
+                    print_acc(f"  -  {label}: no {ema_name}, starting from the raw weights")
+                    continue
+
+                ema_step = load_metadata_from_safetensors(ema_path).get('training_info', {}).get('step')
+                if ema_step != raw_step:
+                    print_acc(f"  -  {label}: {ema_name} is from step {ema_step}, not {raw_step}; "
+                              "starting from the raw weights")
+                    continue
+
+                params = ema._get_parameters(None)
+                with torch.no_grad():
+                    # NaN out the network first: load_weights doesn't report weights the file lacks,
+                    # so anything still NaN afterwards wasn't in the file
+                    for p in params:
+                        if id(p) in network_param_ids:
+                            p.fill_(float('nan'))
+                    self.network.load_weights(ema_path)
+                    incomplete = sum(
+                        1 for p in params if id(p) in network_param_ids and torch.isnan(p).any()
+                    )
+                    if incomplete:
+                        print_acc(f"  -  {label}: {ema_name} is missing (or has NaN in) {incomplete} weights; "
+                                  "starting from the raw weights")
+                        continue
+                    for shadow, p in zip(ema.shadow_params, params):
+                        if id(p) in network_param_ids:
+                            shadow.copy_(p)
+                print_acc(f"  -  {label}: resumed from {ema_name}")
+        finally:
+            # always, so a failed read can never leave EMA or NaN values in the trained weights
+            self.network.load_state_dict(raw_state)
+            del raw_state
+            flush()
 
     def before_dataset_load(self):
         pass
@@ -2141,6 +2216,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"Loading from {latest_save_path}")
                     extra_weights = self.load_weights(latest_save_path)
                     self.network.multiplier = 1.0
+                    # a pretrained lora is a starting point, not a resume, so it has no EMAs to continue
+                    if latest_save_path != self.network_config.pretrained_lora_path:
+                        self._network_resume_path = latest_save_path
                 elif self.train_config.merge_network_on_save and self.network_config.pretrained_lora_path is not None:
                     # with merge_network_on_save, saved checkpoints are full models that get loaded as the
                     # base model. Only load the pretrained lora as the initial lora when we are not resuming
@@ -2316,6 +2394,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # set up the ema now that the optimizer (and its params) are ready
         self.setup_ema()
+        self.restore_emas_from_checkpoint()
 
         lr_scheduler_params = self.train_config.lr_scheduler_params
 
